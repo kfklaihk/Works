@@ -46,7 +46,9 @@ def strip_comments(sql):
     return sql
 
 def norm(s):
-    return s.strip().strip('"').lower()
+    if s is None:
+        return ""
+    return str(s).strip().strip('"').lower()
 
 def node(t, c):
     return f"{norm(t)}.{norm(c)}"
