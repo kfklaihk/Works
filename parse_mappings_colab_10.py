@@ -148,6 +148,11 @@ KEYWORDS = {
     'order', 'union', 'connect', 'minus', 'intersect', 'having', 'values',
     'set', 'and', 'or', 'from', 'select'
 }
+UNQUALIFIED_SKIP = KEYWORDS.union({
+    'case', 'when', 'then', 'else', 'end', 'nvl', 'upper', 'lower', 'decode',
+    'to_date', 'sysdate', 'systimestamp', 'distinct', 'row_number', 'over',
+    'partition', 'by', 'null', 'as'
+})
 
 def find_matching_paren(s, start_idx):
     depth = 0
@@ -210,6 +215,7 @@ def split_select_from(sql):
 def parse_from_clause(from_clause, graph, stats):
     table_aliases = {}
     subquery_aliases = {}
+    primary_alias = None
     clause = from_clause.strip()
     rest = clause
 
@@ -221,6 +227,7 @@ def parse_from_clause(from_clause, graph, stats):
             if alias_match:
                 alias = alias_match.group(1).lower()
                 subquery_aliases[alias] = parse_select_mapping(sub_sql, graph, stats)
+                primary_alias = alias
             rest = clause[end_idx + 1:]
     else:
         first = re.match(r'\s*([a-z0-9_".]+)(?:\s+as)?\s+([a-z][a-z0-9_]*)?', rest, re.I)
@@ -230,6 +237,7 @@ def parse_from_clause(from_clause, graph, stats):
             if alias in KEYWORDS:
                 alias = tbl
             table_aliases[alias] = tbl
+            primary_alias = alias
 
     for m in re.finditer(r'\bjoin\s+([a-z0-9_".]+)(?:\s+as)?\s+([a-z][a-z0-9_]*)?', rest, re.I):
         tbl = norm(m.group(1).split('.')[-1].strip('"'))
@@ -237,20 +245,32 @@ def parse_from_clause(from_clause, graph, stats):
         if alias in KEYWORDS:
             alias = tbl
         table_aliases[alias] = tbl
-    return table_aliases, subquery_aliases
+    return table_aliases, subquery_aliases, primary_alias
 
-def resolve_expr_sources(expr, table_aliases, subquery_aliases, graph, stats):
+def extract_unqualified_cols(expr):
+    expr_clean = re.sub(r"'([^']|'')*'", ' ', expr)
+    expr_clean = re.sub(r'[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*', ' ', expr_clean, flags=re.I)
+    tokens = re.findall(r'\b[a-z][a-z0-9_]*\b', expr_clean, flags=re.I)
+    cols = []
+    for tok in tokens:
+        t = tok.lower()
+        if t in UNQUALIFIED_SKIP:
+            continue
+        cols.append(t)
+    return cols
+
+def resolve_expr_sources(expr, table_aliases, subquery_aliases, graph, stats, default_alias=None):
     expr_clean = expr.strip()
     expr_body = expr_clean
     out_col = None
 
-    m = re.match(r'(.+?)\s+as\s+([a-z0-9_]+)$', expr_clean, re.I)
+    m = re.match(r'(.+?)\s+as\s+([a-z0-9_]+)$', expr_clean, re.I | re.S)
     if m:
         expr_body = m.group(1).strip()
         out_col = m.group(2).lower()
     else:
-        m = re.match(r'(.+?)\s+([a-z0-9_]+)$', expr_clean, re.I)
-        if m and not re.search(r'\)\s*$', m.group(1)):
+        m = re.match(r'(.+?)\s+([a-z0-9_]+)$', expr_clean, re.I | re.S)
+        if m:
             expr_body = m.group(1).strip()
             out_col = m.group(2).lower()
 
@@ -305,6 +325,27 @@ def resolve_expr_sources(expr, table_aliases, subquery_aliases, graph, stats):
                     stats['alias_src'] += 1
         return out_col, sources
 
+    if default_alias:
+        cols = extract_unqualified_cols(expr_body)
+        if cols:
+            sources = set()
+            for col in cols:
+                if default_alias in subquery_aliases:
+                    mapped = subquery_aliases[default_alias].get(col, set())
+                    if mapped:
+                        sources.update(mapped)
+                    else:
+                        sources.add(f"{default_alias}.{col}")
+                else:
+                    sources.add(f"{default_alias}.{col}")
+                    if default_alias in table_aliases:
+                        base_table = table_aliases[default_alias]
+                        graph.edge(node(base_table, col), f"{default_alias}.{col}")
+                        stats['alias_src'] += 1
+            if not out_col and len(cols) == 1:
+                out_col = cols[0]
+            return out_col, sources
+
     return None, set()
 
 def parse_select_mapping(sql, graph, stats):
@@ -313,10 +354,18 @@ def parse_select_mapping(sql, graph, stats):
         select_clause, from_clause = split_select_from(part)
         if not select_clause or not from_clause:
             continue
-        table_aliases, subquery_aliases = parse_from_clause(from_clause, graph, stats)
+        table_aliases, subquery_aliases, primary_alias = parse_from_clause(from_clause, graph, stats)
+        default_alias = primary_alias
+        if not default_alias:
+            if len(subquery_aliases) == 1:
+                default_alias = next(iter(subquery_aliases))
+            elif len(table_aliases) == 1:
+                default_alias = next(iter(table_aliases))
         exprs = split_paren(select_clause)
         for expr in exprs:
-            out_col, sources = resolve_expr_sources(expr, table_aliases, subquery_aliases, graph, stats)
+            out_col, sources = resolve_expr_sources(
+                expr, table_aliases, subquery_aliases, graph, stats, default_alias
+            )
             if out_col and sources:
                 mapping[out_col].update(sources)
     return mapping
