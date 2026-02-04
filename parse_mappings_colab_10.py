@@ -143,6 +143,233 @@ def split_paren(s, delim=','):
         else: cur += c
     return parts + [cur.strip()] if cur.strip() else parts
 
+KEYWORDS = {
+    'where', 'join', 'inner', 'left', 'right', 'full', 'cross', 'on', 'group',
+    'order', 'union', 'connect', 'minus', 'intersect', 'having', 'values',
+    'set', 'and', 'or', 'from', 'select'
+}
+UNQUALIFIED_SKIP = KEYWORDS.union({
+    'case', 'when', 'then', 'else', 'end', 'nvl', 'upper', 'lower', 'decode',
+    'to_date', 'sysdate', 'systimestamp', 'distinct', 'row_number', 'over',
+    'partition', 'by', 'null', 'as'
+})
+
+def find_matching_paren(s, start_idx):
+    depth = 0
+    for i in range(start_idx, len(s)):
+        if s[i] == '(':
+            depth += 1
+        elif s[i] == ')':
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+def split_union_all(sql):
+    parts = []
+    depth = 0
+    start = 0
+    i = 0
+    sql_lower = sql.lower()
+    while i < len(sql):
+        c = sql[i]
+        if c == '(':
+            depth += 1
+        elif c == ')':
+            depth -= 1
+        elif depth == 0 and sql_lower.startswith('union all', i):
+            parts.append(sql[start:i].strip())
+            i += len('union all')
+            start = i
+            continue
+        i += 1
+    tail = sql[start:].strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+def split_select_from(sql):
+    sql_lower = sql.lower()
+    sel_idx = sql_lower.find('select')
+    if sel_idx == -1:
+        return None, None
+    i = sel_idx + len('select')
+    depth = 0
+    from_idx = None
+    while i < len(sql):
+        c = sql[i]
+        if c == '(':
+            depth += 1
+        elif c == ')':
+            depth -= 1
+        elif depth == 0 and sql_lower.startswith('from', i):
+            from_idx = i
+            break
+        i += 1
+    if from_idx is None:
+        return None, None
+    select_clause = sql[sel_idx + len('select'):from_idx].strip()
+    from_clause = sql[from_idx + len('from'):].strip()
+    return select_clause, from_clause
+
+def parse_from_clause(from_clause, graph, stats):
+    table_aliases = {}
+    subquery_aliases = {}
+    primary_alias = None
+    clause = from_clause.strip()
+    rest = clause
+
+    if clause.startswith('('):
+        end_idx = find_matching_paren(clause, 0)
+        if end_idx != -1:
+            sub_sql = clause[1:end_idx]
+            alias_match = re.match(r'\s*([a-z][a-z0-9_]*)', clause[end_idx + 1:], re.I)
+            if alias_match:
+                alias = alias_match.group(1).lower()
+                subquery_aliases[alias] = parse_select_mapping(sub_sql, graph, stats)
+                primary_alias = alias
+            rest = clause[end_idx + 1:]
+    else:
+        first = re.match(r'\s*([a-z0-9_".]+)(?:\s+as)?\s+([a-z][a-z0-9_]*)?', rest, re.I)
+        if first:
+            tbl = norm(first.group(1).split('.')[-1].strip('"'))
+            alias = first.group(2).lower() if first.group(2) else tbl
+            if alias in KEYWORDS:
+                alias = tbl
+            table_aliases[alias] = tbl
+            primary_alias = alias
+
+    for m in re.finditer(r'\bjoin\s+([a-z0-9_".]+)(?:\s+as)?\s+([a-z][a-z0-9_]*)?', rest, re.I):
+        tbl = norm(m.group(1).split('.')[-1].strip('"'))
+        alias = m.group(2).lower() if m.group(2) else tbl
+        if alias in KEYWORDS:
+            alias = tbl
+        table_aliases[alias] = tbl
+    return table_aliases, subquery_aliases, primary_alias
+
+def extract_unqualified_cols(expr):
+    expr_clean = re.sub(r"'([^']|'')*'", ' ', expr)
+    expr_clean = re.sub(r'[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*', ' ', expr_clean, flags=re.I)
+    tokens = re.findall(r'\b[a-z][a-z0-9_]*\b', expr_clean, flags=re.I)
+    cols = []
+    for tok in tokens:
+        t = tok.lower()
+        if t in UNQUALIFIED_SKIP:
+            continue
+        cols.append(t)
+    return cols
+
+def resolve_expr_sources(expr, table_aliases, subquery_aliases, graph, stats, default_alias=None):
+    expr_clean = expr.strip()
+    expr_body = expr_clean
+    out_col = None
+
+    m = re.match(r'(.+?)\s+as\s+([a-z0-9_]+)$', expr_clean, re.I | re.S)
+    if m:
+        expr_body = m.group(1).strip()
+        out_col = m.group(2).lower()
+    else:
+        m = re.match(r'(.+?)\s+([a-z0-9_]+)$', expr_clean, re.I | re.S)
+        if m:
+            expr_body = m.group(1).strip()
+            out_col = m.group(2).lower()
+
+    m = re.match(r'([a-z][a-z0-9_]*)\.([a-z0-9_]+)$', expr_body, re.I)
+    if m:
+        alias = m.group(1).lower()
+        col = m.group(2).lower()
+        if not out_col:
+            out_col = col
+        if alias in subquery_aliases:
+            sources = subquery_aliases[alias].get(col, set())
+            if not sources:
+                sources = {f"{alias}.{col}"}
+        else:
+            sources = {f"{alias}.{col}"}
+        if alias in table_aliases:
+            base_table = table_aliases[alias]
+            graph.edge(node(base_table, col), f"{alias}.{col}")
+            stats['alias_src'] += 1
+        return out_col, sources
+
+    m = re.match(r'([a-z][a-z0-9_]*)$', expr_body, re.I)
+    if m:
+        col = m.group(1).lower()
+        if not out_col:
+            out_col = col
+        sources = set()
+        if len(subquery_aliases) == 1:
+            alias = next(iter(subquery_aliases))
+            mapped = subquery_aliases[alias].get(col, set())
+            if mapped:
+                sources.update(mapped)
+        if not sources and len(table_aliases) == 1:
+            alias = next(iter(table_aliases))
+            sources.add(f"{alias}.{col}")
+            base_table = table_aliases[alias]
+            graph.edge(node(base_table, col), f"{alias}.{col}")
+            stats['alias_src'] += 1
+        return out_col, sources
+
+    col_refs = extract_cols(expr_body)
+    if col_refs:
+        sources = set()
+        for al, col in col_refs:
+            if al in subquery_aliases:
+                sources.update(subquery_aliases[al].get(col, set()))
+            else:
+                sources.add(f"{al}.{col}")
+                if al in table_aliases:
+                    base_table = table_aliases[al]
+                    graph.edge(node(base_table, col), f"{al}.{col}")
+                    stats['alias_src'] += 1
+        return out_col, sources
+
+    if default_alias:
+        cols = extract_unqualified_cols(expr_body)
+        if cols:
+            sources = set()
+            for col in cols:
+                if default_alias in subquery_aliases:
+                    mapped = subquery_aliases[default_alias].get(col, set())
+                    if mapped:
+                        sources.update(mapped)
+                    else:
+                        sources.add(f"{default_alias}.{col}")
+                else:
+                    sources.add(f"{default_alias}.{col}")
+                    if default_alias in table_aliases:
+                        base_table = table_aliases[default_alias]
+                        graph.edge(node(base_table, col), f"{default_alias}.{col}")
+                        stats['alias_src'] += 1
+            if not out_col and len(cols) == 1:
+                out_col = cols[0]
+            return out_col, sources
+
+    return None, set()
+
+def parse_select_mapping(sql, graph, stats):
+    mapping = defaultdict(set)
+    for part in split_union_all(sql):
+        select_clause, from_clause = split_select_from(part)
+        if not select_clause or not from_clause:
+            continue
+        table_aliases, subquery_aliases, primary_alias = parse_from_clause(from_clause, graph, stats)
+        default_alias = primary_alias
+        if not default_alias:
+            if len(subquery_aliases) == 1:
+                default_alias = next(iter(subquery_aliases))
+            elif len(table_aliases) == 1:
+                default_alias = next(iter(table_aliases))
+        exprs = split_paren(select_clause)
+        for expr in exprs:
+            out_col, sources = resolve_expr_sources(
+                expr, table_aliases, subquery_aliases, graph, stats, default_alias
+            )
+            if out_col and sources:
+                mapping[out_col].update(sources)
+    return mapping
+
 def read_files(root):
     files_list = []
     for dp, _, fn in os.walk(root):
@@ -173,199 +400,164 @@ def fmt(p):
 
 def parse_insert_with_nested_subqueries(sql, graph, stats):
     """
-    Parse INSERT statements with nested subqueries like:
-    INSERT INTO dest (col1, col2) 
-    SELECT id.col1, id.col2 
-    FROM (SELECT src.col1, src.col2 FROM source src) id
+    Parse INSERT...SELECT...FROM (subquery) alias patterns and build
+    alias chains for nested subqueries.
     """
     sql_clean = strip_comments(sql)
+    pattern = r'insert\s+into\s+([a-z0-9_".]+)\s*\((.*?)\)\s*select\s+(.*?)\s+from\s*\('
 
-    # Pattern for INSERT...SELECT with nested subquery
-    # This handles the specific pattern in 4.7 - cmn_client_comm_pref.sql
-    pattern = r"INSERT\s+INTO\s+([a-z0-9_]+)\s*\(([^)]+)\)[^;]*?SELECT\s+(.+?)\s+FROM\s*\(\s*SELECT\s+DISTINCT\s+(.+?)\s+FROM\s*\(\s*SELECT\s+(.+?)\s+FROM\s+dm_([a-z0-9_]+)\s+([a-z])"
+    for m in re.finditer(pattern, sql_clean, re.I | re.S):
+        dest_table = norm(m.group(1).split('.')[-1].strip('"'))
+        dest_cols = [norm(c) for c in split_paren(m.group(2))]
+        select_exprs = [e.strip() for e in split_paren(m.group(3))]
 
-    for match in re.finditer(pattern, sql_clean, re.I | re.S):
-        dest_table = norm(match.group(1))
-        dest_cols_str = match.group(2)
-        outer_select = match.group(3)
-        middle_select = match.group(4)
-        inner_select = match.group(5)
-        source_table = "dm_" + match.group(6)
-        source_alias = match.group(7).lower()
+        open_idx = m.end() - 1
+        close_idx = find_matching_paren(sql_clean, open_idx)
+        if close_idx == -1:
+            continue
+        subquery_sql = sql_clean[open_idx + 1:close_idx]
+        alias_match = re.match(r'\s*([a-z][a-z0-9_]*)', sql_clean[close_idx + 1:], re.I)
+        if not alias_match:
+            continue
+        sub_alias = alias_match.group(1).lower()
 
-        # Parse column lists
-        dest_cols = [norm(c) for c in split_paren(dest_cols_str)]
-        outer_exprs = [e.strip() for e in split_paren(outer_select)]
-        inner_exprs = [e.strip() for e in split_paren(inner_select)]
+        sub_mapping = parse_select_mapping(subquery_sql, graph, stats)
+        for out_col, sources in sub_mapping.items():
+            sub_node = f"{sub_alias}.{out_col}"
+            for src in sources:
+                graph.edge(src, sub_node)
+                stats['subq_map'] += 1
 
-        # Build inner column mapping
-        inner_mapping = {}  # Maps output column name -> source column
-        for expr in inner_exprs:
-            # Pattern: m.column or m.column AS alias
-            m = re.match(rf'{source_alias}\.([a-z0-9_]+)(?:\s+AS\s+([a-z0-9_]+))?', expr, re.I)
-            if m:
-                src_col = m.group(1).lower()
-                alias_col = m.group(2).lower() if m.group(2) else src_col
-                inner_mapping[alias_col] = src_col
-
-        # Match by position
-        for i, dest_col in enumerate(dest_cols):
-            if i >= len(outer_exprs):
-                break
-
-            outer_expr = outer_exprs[i]
+        for dest_col, expr in zip(dest_cols, select_exprs):
             dest_node = node(dest_table, dest_col)
+            expr_clean = expr.strip()
+            m_expr = re.match(r'([a-z][a-z0-9_]*)\.([a-z0-9_]+)$', expr_clean, re.I)
+            if m_expr:
+                alias = m_expr.group(1).lower()
+                col = m_expr.group(2).lower()
+                graph.edge(f"{alias}.{col}", dest_node)
+                stats['ins_subq'] += 1
+                continue
 
-            # Check if outer expression is alias.column format (e.g., id.consent_to_direct_marketing)
-            outer_match = re.match(r'([a-z])\.([a-z0-9_]+)', outer_expr, re.I)
-            if outer_match:
-                outer_alias = outer_match.group(1).lower()
-                outer_col = outer_match.group(2).lower()
+            m_bare = re.match(r'([a-z][a-z0-9_]*)$', expr_clean, re.I)
+            if m_bare:
+                col = m_bare.group(1).lower()
+                graph.edge(f"{sub_alias}.{col}", dest_node)
+                stats['ins_subq'] += 1
 
-                # Check if this column comes from inner mapping
-                if outer_col in inner_mapping:
-                    src_col = inner_mapping[outer_col]
+def extract_alias_after_from(after_text):
+    m = re.match(r'\s+([a-z][a-z0-9_]*)', after_text, re.I)
+    if m:
+        alias = m.group(1).lower()
+        if alias not in KEYWORDS:
+            return alias
+    return None
 
-                    # Create edges:
-                    # 1. dm_employer.column -> source_alias.column
-                    src_node = node(source_table, src_col)
-                    inter_node1 = f"{source_alias}.{src_col}"
-                    graph.edge(src_node, inter_node1)
+def map_insert_select(sql_clean, dest_table, source_table, graph, stats,
+                      dest_col=None, source_col=None, stats_key=''):
+    pattern = rf'insert\s+(?:/\*.*?\*/\s*)?into\s+{re.escape(dest_table)}\s*\((.*?)\)\s*select\s+(.*?)\s+from\s+{re.escape(source_table)}\b'
+    for m in re.finditer(pattern, sql_clean, re.I | re.S):
+        dest_cols = [norm(c) for c in split_paren(m.group(1))]
+        select_exprs = [e.strip() for e in split_paren(m.group(2))]
+        alias = extract_alias_after_from(sql_clean[m.end():])
+        source_aliases = {alias} if alias else {source_table}
 
-                    # 2. source_alias.column -> outer_alias.column
-                    inter_node2 = f"{outer_alias}.{outer_col}"
-                    graph.edge(inter_node1, inter_node2)
-
-                    # 3. outer_alias.column -> destination
-                    graph.edge(inter_node2, dest_node)
-
-                    stats['nested_subq'] += 1
+        for dcol, expr in zip(dest_cols, select_exprs):
+            if dest_col and dcol != dest_col:
+                continue
+            used = False
+            for al, sc in extract_cols(expr):
+                if al in source_aliases or al == source_table:
+                    if source_col and sc != source_col:
+                        continue
+                    graph.edge(node(source_table, sc), node(dest_table, dcol))
+                    stats[stats_key or 'ins_select'] += 1
+                    used = True
+            if used:
+                continue
+            expr_lower = expr.strip().lower()
+            m_bare = re.match(r'([a-z][a-z0-9_]*)$', expr_lower)
+            if m_bare:
+                sc = m_bare.group(1).lower()
+                if source_col and sc != source_col:
+                    continue
+                graph.edge(node(source_table, sc), node(dest_table, dcol))
+                stats[stats_key or 'ins_select'] += 1
 
 def parse_temp_table_chains(sql, graph, stats):
     """
     Parse chains like: dm_correlated_person -> cccp_ini_temp -> cccp_temp -> cmn_client_contact_person
     """
     sql_clean = strip_comments(sql)
+    map_insert_select(
+        sql_clean, 'cccp_ini_temp', 'dm_correlated_person', graph, stats,
+        dest_col='mbr_communication_type', source_col='mbr_communication_type',
+        stats_key='temp1'
+    )
+    map_insert_select(
+        sql_clean, 'cccp_temp', 'cccp_ini_temp', graph, stats,
+        dest_col='mbr_communication_type', source_col='mbr_communication_type',
+        stats_key='temp2'
+    )
+    map_insert_select(
+        sql_clean, 'cmn_client_contact_person', 'cccp_temp', graph, stats,
+        dest_col='av_notify_medium_code', source_col='mbr_communication_type',
+        stats_key='temp3'
+    )
 
-    # Step 1: Parse dm_correlated_person -> cccp_ini_temp
-    # Pattern: INSERT INTO cccp_ini_temp (...) SELECT ... FROM dm_correlated_person
-    pattern1 = r"insert\s+into\s+cccp_ini_temp\s*\(([^)]+)\)[^;]*?select\s+(.+?)\s+from\s+dm_correlated_person\s+([a-z])"
+def parse_if_assignments(sql_clean, graph, stats):
+    if_pattern = re.compile(r'\bif\b[\s\S]*?\bend if\b\s*;', re.I)
+    branch_pattern = re.compile(r'\b(if|elsif)\b\s+(.*?)\bthen\b', re.I | re.S)
 
-    for match in re.finditer(pattern1, sql_clean, re.I | re.S):
-        cols_str = match.group(1)
-        select_clause = match.group(2)
-        table_alias = match.group(3).lower()
+    for if_match in if_pattern.finditer(sql_clean):
+        block = if_match.group(0)
+        branches = list(branch_pattern.finditer(block))
+        if not branches:
+            continue
 
-        cols = [norm(c) for c in split_paren(cols_str)]
-        exprs = [e.strip() for e in split_paren(select_clause)]
+        for idx, br in enumerate(branches):
+            cond = br.group(2)
+            start = br.end()
+            next_start = branches[idx + 1].start() if idx + 1 < len(branches) else None
+            end = next_start if next_start is not None else block.lower().rfind('end if')
+            else_match = re.search(r'\belse\b', block[start:end], re.I)
+            if else_match:
+                end = start + else_match.start()
+            body = block[start:end]
 
-        for col, expr in zip(cols, exprs):
-            # Check if expr is table_alias.column
-            m = re.match(rf'{table_alias}\.([a-z0-9_]+)', expr, re.I)
-            if m:
-                src_col = m.group(1).lower()
-                src_node = node('dm_correlated_person', src_col)
-                dest_node = node('cccp_ini_temp', col)
-                graph.edge(src_node, dest_node)
-                stats['temp1'] += 1
-            elif re.match(r'^[a-z0-9_]+$', expr, re.I):
-                # Simple column name
-                src_node = node('dm_correlated_person', expr.lower())
-                dest_node = node('cccp_ini_temp', col)
-                graph.edge(src_node, dest_node)
-                stats['temp1'] += 1
+            for assign in re.finditer(r'\b([a-z][a-z0-9_]*)\s*:=\s*([^;]+);', body, re.I | re.S):
+                var = assign.group(1).lower()
+                ctx, aliases = None, {}
+                for lv, info in graph.loop_vars.items():
+                    if re.search(rf'\b{re.escape(lv)}\.', cond, re.I):
+                        ctx, aliases = lv, info['aliases']
+                        break
 
-    # Step 2: Parse cccp_ini_temp -> cccp_temp
-    # Pattern: INSERT INTO cccp_temp (...) SELECT ... FROM cccp_ini_temp
-    pattern2 = r"insert\s+into\s+cccp_temp\s*\(([^)]+)\)[^;]*?select\s+(.+?)\s+from\s+cccp_ini_temp"
+                col_refs = extract_cols(cond)
+                if not col_refs and ctx:
+                    col_refs = [(ctx, c) for c in extract_unqualified_cols(cond)]
+                if not col_refs:
+                    continue
 
-    for match in re.finditer(pattern2, sql_clean, re.I | re.S):
-        cols_str = match.group(1)
-        select_clause = match.group(2)
-
-        cols = [norm(c) for c in split_paren(cols_str)]
-        exprs = [e.strip() for e in split_paren(select_clause)]
-
-        for col, expr in zip(cols, exprs):
-            expr_lower = expr.lower()
-            # Skip functions and literals
-            if any(x in expr_lower for x in ['row_number', 'generate_guid', 'sysdate', 'null']):
-                continue
-            if expr_lower.startswith("'"):
-                continue
-
-            # Extract column name
-            m = re.match(r'([a-z0-9_]+)', expr, re.I)
-            if m:
-                src_col = m.group(1).lower()
-                src_node = node('cccp_ini_temp', src_col)
-                dest_node = node('cccp_temp', col)
-                graph.edge(src_node, dest_node)
-                stats['temp2'] += 1
-
-    # Step 3: Parse cccp_temp -> cmn_client_contact_person
-    # Pattern: INSERT INTO cmn_client_contact_person (...) SELECT ... FROM cccp_temp
-    pattern3 = r"insert\s+into\s+cmn_client_contact_person\s*\(([^)]+)\)[^;]*?select\s+(.+?)\s+from\s+cccp_temp\s+([a-z0-9_]+)"
-
-    for match in re.finditer(pattern3, sql_clean, re.I | re.S):
-        cols_str = match.group(1)
-        select_clause = match.group(2)
-        table_alias = match.group(3).lower()
-
-        cols = [norm(c) for c in split_paren(cols_str)]
-        # Split by comma but be careful with function calls
-        exprs = split_paren(select_clause)
-
-        for col, expr in zip(cols, exprs):
-            expr_clean = expr.strip()
-            expr_lower = expr_clean.lower()
-
-            # Skip literals and functions without column refs
-            if expr_lower in ['null', 'sysdate', 'systimestamp', "'n'"]:
-                continue
-            if expr_lower.startswith("'"):
-                continue
-
-            dest_node = node('cmn_client_contact_person', col)
-
-            # Handle NVL(alias.column, ...)
-            nvl_match = re.match(r'nvl\s*\(([^,]+),', expr_clean, re.I)
-            if nvl_match:
-                inner = nvl_match.group(1).strip()
-                col_refs = extract_cols(inner)
-                for al, src_col in col_refs:
-                    if al == table_alias:
-                        src_node = node('cccp_temp', src_col)
-                        graph.edge(src_node, dest_node)
-                        stats['temp3_nvl'] += 1
-                continue
-
-            # Handle CASE expressions
-            if 'case' in expr_lower:
-                col_refs = extract_cols(expr_clean)
-                for al, src_col in col_refs:
-                    if al == table_alias:
-                        src_node = node('cccp_temp', src_col)
-                        graph.edge(src_node, dest_node)
-                        stats['temp3_case'] += 1
-                continue
-
-            # Extract all column references
-            col_refs = extract_cols(expr_clean)
-            if col_refs:
-                for al, src_col in col_refs:
-                    if al == table_alias:
-                        src_node = node('cccp_temp', src_col)
-                        graph.edge(src_node, dest_node)
-                        stats['temp3'] += 1
-            else:
-                # Simple column name without table prefix
-                m = re.match(r'([a-z0-9_]+)', expr_clean, re.I)
-                if m:
-                    src_col = m.group(1).lower()
-                    src_node = node('cccp_temp', src_col)
-                    graph.edge(src_node, dest_node)
-                    stats['temp3'] += 1
+                for al, col in col_refs:
+                    if ctx:
+                        tbl = aliases.get(al, al)
+                        if graph.cursor_defs.get(graph.loop_vars[ctx]['cursor']):
+                            cursor_aliases = graph.cursor_defs[graph.loop_vars[ctx]['cursor']]['aliases']
+                            if al in cursor_aliases:
+                                tbl = cursor_aliases[al]
+                            elif cursor_aliases and tbl == al:
+                                tbl = list(cursor_aliases.values())[0]
+                        src = node(tbl, col)
+                        inter = f"{ctx}.{col}"
+                        graph.edge(src, inter)
+                        graph.edge(inter, var)
+                        graph.var_sources[var] = inter
+                    else:
+                        src = node(al, col)
+                        graph.edge(src, var)
+                        graph.var_sources[var] = src
+                    stats['if_assign'] += 1
 
 def parse_sql(content, graph):
     stats = defaultdict(int)
@@ -425,6 +617,9 @@ def parse_sql(content, graph):
                 graph.edge(src, var); graph.var_sources[var] = src
             stats['assign'] += 1
 
+    # IF/ELSIF assignments based on conditions
+    parse_if_assignments(sql_clean, graph, stats)
+
     # INSERT VALUES
     all_al = {}
     for info in graph.loop_vars.values(): all_al.update(info['aliases'])
@@ -478,13 +673,25 @@ def parse_sql(content, graph):
 
     return stats
 
-def process(files_list):
+def needs_multi_pass(sql_text, source_pairs):
+    sql_lower = sql_text.lower()
+    for tbl, col in source_pairs:
+        if re.search(rf'\b{re.escape(tbl)}\b', sql_lower) and re.search(rf'\b{re.escape(col)}\b', sql_lower):
+            return True
+    return False
+
+def process(files_list, queries, max_passes=5):
     g = Graph()
     totals = defaultdict(int)
+    source_pairs = {(q['source_table'], q['source_field']) for q in queries}
     for name, content in files_list:
-        print(f"Processing: {name}")
-        stats = parse_sql(content, g)
-        for k, v in stats.items(): totals[k] += v
+        sql_clean = strip_comments(content)
+        pass_count = max_passes if needs_multi_pass(sql_clean, source_pairs) else 1
+        print(f"Processing: {name} (passes: {pass_count})")
+        for _ in range(pass_count):
+            stats = parse_sql(content, g)
+            for k, v in stats.items():
+                totals[k] += v
     print(f"\nTotals: {dict(totals)}")
     return g
 
@@ -493,21 +700,37 @@ def load_maps(path):
         return [{k: norm(v) for k, v in m.items()} for m in json.load(f)]
 
 def get_longest_path_only(paths):
-    """Filter paths to keep only the longest ones when paths share the same end node."""
+    """Filter paths to keep only those that are not subpaths of longer paths."""
     if not paths:
         return []
 
-    by_end = defaultdict(list)
+    unique = []
+    seen = set()
     for p in paths:
-        if p:
-            by_end[p[-1]].append(p)
+        if not p:
+            continue
+        key = tuple(p)
+        if key not in seen:
+            unique.append(p)
+            seen.add(key)
 
-    result = []
-    for end_node, paths_list in by_end.items():
-        longest = max(paths_list, key=len)
-        result.append(longest)
+    unique.sort(key=len, reverse=True)
+    def is_subsequence(short, long):
+        idx = 0
+        for node in short:
+            while idx < len(long) and long[idx] != node:
+                idx += 1
+            if idx == len(long):
+                return False
+            idx += 1
+        return True
 
-    return result
+    kept = []
+    for p in unique:
+        if any(len(k) >= len(p) and is_subsequence(p, k) for k in kept):
+            continue
+        kept.append(p)
+    return kept
 
 # ==============================================================================
 # RUN ANALYSIS
@@ -519,8 +742,8 @@ print("=" * 70)
 
 files_list = read_files('/content/sql_files')
 print(f"\nFound {len(files_list)} SQL file(s)")
-g = process(files_list)
 queries = load_maps('/content/mappings.json')
+g = process(files_list, queries)
 
 out_file = '/content/mapping_results.csv'
 with open(out_file, 'w', newline='', encoding='utf-8') as f:
