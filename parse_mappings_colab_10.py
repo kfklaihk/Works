@@ -505,6 +505,60 @@ def parse_temp_table_chains(sql, graph, stats):
         stats_key='temp3'
     )
 
+def parse_if_assignments(sql_clean, graph, stats):
+    if_pattern = re.compile(r'\bif\b[\s\S]*?\bend if\b\s*;', re.I)
+    branch_pattern = re.compile(r'\b(if|elsif)\b\s+(.*?)\bthen\b', re.I | re.S)
+
+    for if_match in if_pattern.finditer(sql_clean):
+        block = if_match.group(0)
+        branches = list(branch_pattern.finditer(block))
+        if not branches:
+            continue
+
+        for idx, br in enumerate(branches):
+            cond = br.group(2)
+            start = br.end()
+            next_start = branches[idx + 1].start() if idx + 1 < len(branches) else None
+            end = next_start if next_start is not None else block.lower().rfind('end if')
+            else_match = re.search(r'\belse\b', block[start:end], re.I)
+            if else_match:
+                end = start + else_match.start()
+            body = block[start:end]
+
+            for assign in re.finditer(r'\b([a-z][a-z0-9_]*)\s*:=\s*([^;]+);', body, re.I | re.S):
+                var = assign.group(1).lower()
+                ctx, aliases = None, {}
+                for lv, info in graph.loop_vars.items():
+                    if re.search(rf'\b{re.escape(lv)}\.', cond, re.I):
+                        ctx, aliases = lv, info['aliases']
+                        break
+
+                col_refs = extract_cols(cond)
+                if not col_refs and ctx:
+                    col_refs = [(ctx, c) for c in extract_unqualified_cols(cond)]
+                if not col_refs:
+                    continue
+
+                for al, col in col_refs:
+                    if ctx:
+                        tbl = aliases.get(al, al)
+                        if graph.cursor_defs.get(graph.loop_vars[ctx]['cursor']):
+                            cursor_aliases = graph.cursor_defs[graph.loop_vars[ctx]['cursor']]['aliases']
+                            if al in cursor_aliases:
+                                tbl = cursor_aliases[al]
+                            elif cursor_aliases and tbl == al:
+                                tbl = list(cursor_aliases.values())[0]
+                        src = node(tbl, col)
+                        inter = f"{ctx}.{col}"
+                        graph.edge(src, inter)
+                        graph.edge(inter, var)
+                        graph.var_sources[var] = inter
+                    else:
+                        src = node(al, col)
+                        graph.edge(src, var)
+                        graph.var_sources[var] = src
+                    stats['if_assign'] += 1
+
 def parse_sql(content, graph):
     stats = defaultdict(int)
 
@@ -562,6 +616,9 @@ def parse_sql(content, graph):
             else:
                 graph.edge(src, var); graph.var_sources[var] = src
             stats['assign'] += 1
+
+    # IF/ELSIF assignments based on conditions
+    parse_if_assignments(sql_clean, graph, stats)
 
     # INSERT VALUES
     all_al = {}
