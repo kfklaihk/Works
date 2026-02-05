@@ -422,6 +422,16 @@ def resolve_expr_sources(expr, table_aliases, subquery_aliases, graph, stats, de
 
     return None, set()
 
+def strip_select_alias(expr):
+    expr_clean = expr.strip()
+    m = re.match(r'(.+?)\s+as\s+[a-z0-9_]+$', expr_clean, re.I | re.S)
+    if m:
+        return m.group(1).strip()
+    m = re.match(r'(.+?)\s+[a-z0-9_]+$', expr_clean, re.I | re.S)
+    if m:
+        return m.group(1).strip()
+    return expr_clean
+
 def parse_select_mapping(sql, graph, stats):
     mapping = defaultdict(set)
     for part in split_union_all(sql):
@@ -445,7 +455,8 @@ def parse_select_mapping(sql, graph, stats):
             )
             if out_col and sources:
                 mapping[out_col].update(sources)
-            m = re.match(r'\s*([a-z][a-z0-9_]*)\.([a-z][a-z0-9_]*)\s*$', expr.strip(), re.I)
+            expr_body = strip_select_alias(expr)
+            m = re.match(r'\s*([a-z][a-z0-9_]*)\.([a-z][a-z0-9_]*)\s*$', expr_body, re.I)
             if m:
                 alias, col = m.group(1).lower(), m.group(2).lower()
                 for join_col in join_cols_by_alias.get(alias, set()):
@@ -551,18 +562,38 @@ def parse_insert_select_statements(sql, graph, stats):
         select_clause, from_clause = split_select_from(select_sql)
         if not select_clause or not from_clause:
             continue
-        if from_clause.lstrip().startswith('('):
-            continue
-        table_aliases, subquery_aliases, primary_alias = parse_from_clause(from_clause, graph, stats)
+        table_aliases = {}
+        subquery_aliases = {}
+        primary_alias = None
+        join_cols_by_alias = defaultdict(set)
+        from_clause_stripped = from_clause.lstrip()
+        if from_clause_stripped.startswith('('):
+            end_idx = find_matching_paren(from_clause_stripped, 0)
+            if end_idx != -1:
+                sub_sql = from_clause_stripped[1:end_idx]
+                alias_match = re.match(r'\s*([a-z][a-z0-9_]*)', from_clause_stripped[end_idx + 1:], re.I)
+                if alias_match:
+                    alias = alias_match.group(1).lower()
+                    subquery_aliases[alias] = parse_select_mapping(sub_sql, graph, stats)
+                    primary_alias = alias
+                    join_cols_by_alias = parse_join_conditions(
+                        from_clause, table_aliases, subquery_aliases, primary_alias, graph, stats
+                    )
+                else:
+                    pseudo = "_subq"
+                    subquery_aliases[pseudo] = parse_select_mapping(sub_sql, graph, stats)
+                    primary_alias = pseudo
+        else:
+            table_aliases, subquery_aliases, primary_alias = parse_from_clause(from_clause, graph, stats)
+            join_cols_by_alias = parse_join_conditions(
+                from_clause, table_aliases, subquery_aliases, primary_alias, graph, stats
+            )
         default_alias = primary_alias
         if not default_alias:
             if len(subquery_aliases) == 1:
                 default_alias = next(iter(subquery_aliases))
             elif len(table_aliases) == 1:
                 default_alias = next(iter(table_aliases))
-        join_cols_by_alias = parse_join_conditions(
-            from_clause, table_aliases, subquery_aliases, default_alias, graph, stats
-        )
         exprs = split_paren(select_clause)
         for dest_col, expr in zip(dest_cols, exprs):
             dest_node = node(dest_table, dest_col)
@@ -572,7 +603,8 @@ def parse_insert_select_statements(sql, graph, stats):
             for src in sources:
                 graph.edge(src, dest_node)
                 stats['ins_select'] += 1
-            m_expr = re.match(r'\s*([a-z][a-z0-9_]*)\.([a-z][a-z0-9_]*)\s*$', expr.strip(), re.I)
+            expr_body = strip_select_alias(expr)
+            m_expr = re.match(r'\s*([a-z][a-z0-9_]*)\.([a-z][a-z0-9_]*)\s*$', expr_body, re.I)
             if m_expr:
                 alias, col = m_expr.group(1).lower(), m_expr.group(2).lower()
                 for join_col in join_cols_by_alias.get(alias, set()):
@@ -726,7 +758,8 @@ def parse_sql(content, graph):
             for t in re.finditer(r'from\s+([a-z][a-z0-9_]+)(?:\s+([a-z][a-z0-9_]*))?', body, re.I):
                 tbl, al = t.group(1).lower(), (t.group(2) or t.group(1)).lower()
                 aliases[al] = tbl
-        graph.cursor_defs[name] = {'aliases': aliases}
+        mapping = parse_select_mapping(body, graph, stats)
+        graph.cursor_defs[name] = {'aliases': aliases, 'mapping': mapping}
         graph.cursor_aliases[name] = aliases
 
     # FOR loops
@@ -772,11 +805,21 @@ def parse_sql(content, graph):
                 graph.edge(vlow, dst); stats['ins_var'] += 1
             elif '.' in vlow and not vlow.startswith('to_date') and not vlow.startswith('decode'):
                 for al, sc in extract_cols(val):
-                    src = node(all_al.get(al, al), sc)
                     if al in graph.loop_vars:
                         inter = f"{al}.{sc}"
-                        graph.edge(src, inter); graph.edge(inter, dst); stats['ins_loop'] += 1
+                        cursor_name = graph.loop_vars[al]['cursor']
+                        mapping = graph.cursor_defs.get(cursor_name, {}).get('mapping', {})
+                        sources = mapping.get(sc, set())
+                        if sources:
+                            for src in sources:
+                                graph.edge(src, inter)
+                        else:
+                            src = node(all_al.get(al, al), sc)
+                            graph.edge(src, inter)
+                        graph.edge(inter, dst)
+                        stats['ins_loop'] += 1
                     else:
+                        src = node(all_al.get(al, al), sc)
                         graph.edge(src, dst); stats['ins_col'] += 1
             elif 'to_date(' in vlow:
                 for al, sc in extract_cols(val):
