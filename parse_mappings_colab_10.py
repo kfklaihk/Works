@@ -214,6 +214,78 @@ def split_select_from(sql):
     from_clause = sql[from_idx + len('from'):].strip()
     return select_clause, from_clause
 
+def split_conditions(s):
+    parts, depth, cur = [], 0, ""
+    i = 0
+    s_len = len(s)
+    while i < s_len:
+        c = s[i]
+        if c == '(':
+            depth += 1
+            cur += c
+        elif c == ')':
+            depth -= 1
+            cur += c
+        elif depth == 0 and s[i:i+3].lower() == 'and' and (i == 0 or not s[i-1].isalnum()):
+            parts.append(cur.strip())
+            cur = ""
+            i += 3
+            continue
+        else:
+            cur += c
+        i += 1
+    if cur.strip():
+        parts.append(cur.strip())
+    return parts
+
+def parse_join_conditions(from_clause, table_aliases, subquery_aliases, default_alias, graph, stats):
+    join_cols_by_alias = defaultdict(set)
+    on_pattern = re.compile(r'\bon\b\s+([\s\S]*?)(?=\b(join|where|group|order|union|having|$))', re.I)
+    for on_match in on_pattern.finditer(from_clause):
+        cond_block = on_match.group(1)
+        for cond in split_conditions(cond_block):
+            if not cond:
+                continue
+            eq_parts = cond.split('=')
+            if len(eq_parts) != 2:
+                continue
+            left = eq_parts[0].strip()
+            right = eq_parts[1].strip()
+
+            m_left = re.match(r'([a-z][a-z0-9_]*)\.([a-z][a-z0-9_]*)$', left, re.I)
+            m_right = re.match(r'([a-z][a-z0-9_]*)\.([a-z][a-z0-9_]*)$', right, re.I)
+
+            if m_left and not m_right:
+                alias, col = m_left.group(1).lower(), m_left.group(2).lower()
+                out_col, sources = resolve_expr_sources(
+                    right, table_aliases, subquery_aliases, graph, stats, default_alias
+                )
+                if sources:
+                    for src in sources:
+                        graph.edge(src, f"{alias}.{col}")
+                        stats['join_cond'] += 1
+                    join_cols_by_alias[alias].add(col)
+            elif m_right and not m_left:
+                alias, col = m_right.group(1).lower(), m_right.group(2).lower()
+                out_col, sources = resolve_expr_sources(
+                    left, table_aliases, subquery_aliases, graph, stats, default_alias
+                )
+                if sources:
+                    for src in sources:
+                        graph.edge(src, f"{alias}.{col}")
+                        stats['join_cond'] += 1
+                    join_cols_by_alias[alias].add(col)
+            elif m_left and m_right:
+                l_alias, l_col = m_left.group(1).lower(), m_left.group(2).lower()
+                r_alias, r_col = m_right.group(1).lower(), m_right.group(2).lower()
+                graph.edge(f"{r_alias}.{r_col}", f"{l_alias}.{l_col}")
+                graph.edge(f"{l_alias}.{l_col}", f"{r_alias}.{r_col}")
+                join_cols_by_alias[l_alias].add(l_col)
+                join_cols_by_alias[r_alias].add(r_col)
+                stats['join_cond'] += 2
+
+    return join_cols_by_alias
+
 def parse_from_clause(from_clause, graph, stats):
     table_aliases = {}
     subquery_aliases = {}
@@ -363,6 +435,9 @@ def parse_select_mapping(sql, graph, stats):
                 default_alias = next(iter(subquery_aliases))
             elif len(table_aliases) == 1:
                 default_alias = next(iter(table_aliases))
+        join_cols_by_alias = parse_join_conditions(
+            from_clause, table_aliases, subquery_aliases, default_alias, graph, stats
+        )
         exprs = split_paren(select_clause)
         for expr in exprs:
             out_col, sources = resolve_expr_sources(
@@ -370,6 +445,13 @@ def parse_select_mapping(sql, graph, stats):
             )
             if out_col and sources:
                 mapping[out_col].update(sources)
+            m = re.match(r'\s*([a-z][a-z0-9_]*)\.([a-z][a-z0-9_]*)\s*$', expr.strip(), re.I)
+            if m:
+                alias, col = m.group(1).lower(), m.group(2).lower()
+                for join_col in join_cols_by_alias.get(alias, set()):
+                    if join_col != col:
+                        graph.edge(f"{alias}.{join_col}", f"{alias}.{col}")
+                        stats['join_to_select'] += 1
     return mapping
 
 def read_files(root):
@@ -446,6 +528,57 @@ def parse_insert_with_nested_subqueries(sql, graph, stats):
                 col = m_bare.group(1).lower()
                 graph.edge(f"{sub_alias}.{col}", dest_node)
                 stats['ins_subq'] += 1
+
+def parse_insert_select_statements(sql, graph, stats):
+    sql_clean = strip_comments(sql)
+    pattern = re.compile(r'insert\s+into\s+([a-z0-9_".]+)\s*\((.*?)\)\s*select\b', re.I | re.S)
+    for m in pattern.finditer(sql_clean):
+        dest_table = norm(m.group(1).split('.')[-1].strip('"'))
+        dest_cols = [norm(c) for c in split_paren(m.group(2))]
+        select_start = m.end() - len('select')
+        depth = 0
+        end_idx = None
+        for i in range(m.end(), len(sql_clean)):
+            c = sql_clean[i]
+            if c == '(':
+                depth += 1
+            elif c == ')':
+                depth -= 1
+            elif c == ';' and depth == 0:
+                end_idx = i
+                break
+        select_sql = sql_clean[select_start:end_idx].strip() if end_idx else sql_clean[select_start:].strip()
+        select_clause, from_clause = split_select_from(select_sql)
+        if not select_clause or not from_clause:
+            continue
+        if from_clause.lstrip().startswith('('):
+            continue
+        table_aliases, subquery_aliases, primary_alias = parse_from_clause(from_clause, graph, stats)
+        default_alias = primary_alias
+        if not default_alias:
+            if len(subquery_aliases) == 1:
+                default_alias = next(iter(subquery_aliases))
+            elif len(table_aliases) == 1:
+                default_alias = next(iter(table_aliases))
+        join_cols_by_alias = parse_join_conditions(
+            from_clause, table_aliases, subquery_aliases, default_alias, graph, stats
+        )
+        exprs = split_paren(select_clause)
+        for dest_col, expr in zip(dest_cols, exprs):
+            dest_node = node(dest_table, dest_col)
+            out_col, sources = resolve_expr_sources(
+                expr, table_aliases, subquery_aliases, graph, stats, default_alias
+            )
+            for src in sources:
+                graph.edge(src, dest_node)
+                stats['ins_select'] += 1
+            m_expr = re.match(r'\s*([a-z][a-z0-9_]*)\.([a-z][a-z0-9_]*)\s*$', expr.strip(), re.I)
+            if m_expr:
+                alias, col = m_expr.group(1).lower(), m_expr.group(2).lower()
+                for join_col in join_cols_by_alias.get(alias, set()):
+                    if join_col != col:
+                        graph.edge(f"{alias}.{join_col}", f"{alias}.{col}")
+                        stats['join_to_select'] += 1
 
 def extract_alias_after_from(after_text):
     m = re.match(r'\s+([a-z][a-z0-9_]*)', after_text, re.I)
@@ -563,6 +696,9 @@ def parse_if_assignments(sql_clean, graph, stats):
 
 def parse_sql(content, graph):
     stats = defaultdict(int)
+
+    # Parse INSERT...SELECT statements (direct table sources)
+    parse_insert_select_statements(content, graph, stats)
 
     # Parse INSERT with nested subqueries (handles mapping 3)
     parse_insert_with_nested_subqueries(content, graph, stats)
@@ -682,7 +818,7 @@ def needs_multi_pass(sql_text, source_pairs):
             return True
     return False
 
-def process(files_list, queries, max_passes=5):
+def process(files_list, queries, max_passes=10):
     g = Graph()
     totals = defaultdict(int)
     source_pairs = {(q['source_table'], q['source_field']) for q in queries}
@@ -775,15 +911,14 @@ with open(out_file, 'w', newline='', encoding='utf-8') as f:
 
         inters = [n for n in longest[1:-1] if '.' not in n or '[' in n] if longest else []
 
-        # For alternatives, find other paths that don't end at the target
+        # Always report alternative paths to other destinations
         alts = []
-        if not found:
-            all_reachable = g.all_destinations(src)
-            target_end = node(q['dest_table'], q['dest_field'])
-            other_paths = [p for p in all_reachable if p and p[-1] != target_end]
-            if other_paths:
-                other_longest = get_longest_path_only(other_paths)
-                alts = [fmt(p) for p in sorted(other_longest, key=len, reverse=True)[:5]]
+        all_reachable = g.all_destinations(src)
+        target_end = node(q['dest_table'], q['dest_field'])
+        other_paths = [p for p in all_reachable if p and p[-1] != target_end]
+        if other_paths:
+            other_longest = get_longest_path_only(other_paths)
+            alts = [fmt(p) for p in sorted(other_longest, key=len, reverse=True)]
 
         alts_str = '|||'.join(alts)
 
@@ -801,7 +936,7 @@ with open(out_file, 'w', newline='', encoding='utf-8') as f:
         elif alts_str:
             print("  ❌ No direct path to target")
             print("  Alternative paths found:")
-            for a in alts_str.split('|||')[:3]: 
+            for a in alts_str.split('|||')[:3]:
                 print(f"    → {a}")
         else:
             print("  ❌ No path found")
