@@ -861,7 +861,7 @@ def needs_multi_pass(sql_text, source_pairs):
             return True
     return False
 
-def process(files_list, queries, max_passes=10):
+def process(files_list, queries, max_passes=6):
     g = Graph()
     totals = defaultdict(int)
     source_pairs = {(q['source_table'], q['source_field']) for q in queries}
