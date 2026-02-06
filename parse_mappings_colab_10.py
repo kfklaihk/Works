@@ -11,6 +11,10 @@ import csv
 import zipfile
 from collections import defaultdict, deque
 
+SQL_FILE_CACHE_ROOT = None
+SQL_FILE_CACHE_LIST = None
+SQL_CLEAN_CACHE = {}
+
 print("=" * 70)
 print("STEP 1: Upload mappings.json")
 print("=" * 70)
@@ -31,6 +35,11 @@ extract_path = '/content/sql_files'
 os.makedirs(extract_path, exist_ok=True)
 with zipfile.ZipFile(f'/content/{zip_name}', 'r') as z:
     z.extractall(extract_path)
+
+# Reset caches after new extraction
+SQL_FILE_CACHE_ROOT = None
+SQL_FILE_CACHE_LIST = None
+SQL_CLEAN_CACHE = {}
 
 sql_count = sum(1 for root, dirs, files in os.walk(extract_path) 
                 for f in files if f.lower().endswith('.sql'))
@@ -465,15 +474,28 @@ def parse_select_mapping(sql, graph, stats):
                         stats['join_to_select'] += 1
     return mapping
 
-def read_files(root):
+def read_files(root, use_cache=True):
+    global SQL_FILE_CACHE_ROOT, SQL_FILE_CACHE_LIST, SQL_CLEAN_CACHE
+    if use_cache and SQL_FILE_CACHE_ROOT == root and SQL_FILE_CACHE_LIST is not None:
+        return SQL_FILE_CACHE_LIST
+
     files_list = []
+    SQL_CLEAN_CACHE = {}
     for dp, _, fn in os.walk(root):
         for f in fn:
             if f.lower().endswith('.sql'):
+                full_path = os.path.join(dp, f)
                 try:
-                    with open(os.path.join(dp, f), 'r', encoding='utf-8', errors='ignore') as fh:
-                        files_list.append((f, fh.read()))
-                except: pass
+                    with open(full_path, 'r', encoding='utf-8', errors='ignore') as fh:
+                        content = fh.read()
+                        rel_path = os.path.relpath(full_path, root)
+                        files_list.append((rel_path, content))
+                        if use_cache:
+                            SQL_CLEAN_CACHE[rel_path] = strip_comments(content)
+                except:
+                    pass
+    SQL_FILE_CACHE_ROOT = root
+    SQL_FILE_CACHE_LIST = files_list
     return files_list
 
 def fmt(p):
@@ -493,12 +515,13 @@ def fmt(p):
             parts.append(f"{n}")
     return ' -> '.join(parts)
 
-def parse_insert_with_nested_subqueries(sql, graph, stats):
+def parse_insert_with_nested_subqueries(sql, graph, stats, sql_clean=None):
     """
     Parse INSERT...SELECT...FROM (subquery) alias patterns and build
     alias chains for nested subqueries.
     """
-    sql_clean = strip_comments(sql)
+    if sql_clean is None:
+        sql_clean = strip_comments(sql)
     pattern = r'insert\s+into\s+([a-z0-9_".]+)\s*\((.*?)\)\s*select\s+(.*?)\s+from\s*\('
 
     for m in re.finditer(pattern, sql_clean, re.I | re.S):
@@ -540,8 +563,9 @@ def parse_insert_with_nested_subqueries(sql, graph, stats):
                 graph.edge(f"{sub_alias}.{col}", dest_node)
                 stats['ins_subq'] += 1
 
-def parse_insert_select_statements(sql, graph, stats):
-    sql_clean = strip_comments(sql)
+def parse_insert_select_statements(sql, graph, stats, sql_clean=None):
+    if sql_clean is None:
+        sql_clean = strip_comments(sql)
     pattern = re.compile(r'insert\s+into\s+([a-z0-9_".]+)\s*\((.*?)\)\s*select\b', re.I | re.S)
     for m in pattern.finditer(sql_clean):
         dest_table = norm(m.group(1).split('.')[-1].strip('"'))
@@ -651,11 +675,12 @@ def map_insert_select(sql_clean, dest_table, source_table, graph, stats,
                 graph.edge(node(source_table, sc), node(dest_table, dcol))
                 stats[stats_key or 'ins_select'] += 1
 
-def parse_temp_table_chains(sql, graph, stats):
+def parse_temp_table_chains(sql, graph, stats, sql_clean=None):
     """
     Parse chains like: dm_correlated_person -> cccp_ini_temp -> cccp_temp -> cmn_client_contact_person
     """
-    sql_clean = strip_comments(sql)
+    if sql_clean is None:
+        sql_clean = strip_comments(sql)
     map_insert_select(
         sql_clean, 'cccp_ini_temp', 'dm_correlated_person', graph, stats,
         dest_col='mbr_communication_type', source_col='mbr_communication_type',
@@ -726,20 +751,22 @@ def parse_if_assignments(sql_clean, graph, stats):
                         graph.var_sources[var] = src
                     stats['if_assign'] += 1
 
-def parse_sql(content, graph):
+def parse_sql(content, graph, sql_clean=None):
     stats = defaultdict(int)
 
+    if sql_clean is None:
+        sql_clean = strip_comments(content)
+
     # Parse INSERT...SELECT statements (direct table sources)
-    parse_insert_select_statements(content, graph, stats)
+    parse_insert_select_statements(content, graph, stats, sql_clean)
 
     # Parse INSERT with nested subqueries (handles mapping 3)
-    parse_insert_with_nested_subqueries(content, graph, stats)
+    parse_insert_with_nested_subqueries(content, graph, stats, sql_clean)
 
     # Parse temp table chains (handles mapping 4)
-    parse_temp_table_chains(content, graph, stats)
+    parse_temp_table_chains(content, graph, stats, sql_clean)
 
     # Original parsing for cursor-based patterns
-    sql_clean = strip_comments(content)
 
     # Cursors
     for m in re.finditer(r'\bcursor\s+([a-z][a-z0-9_]*)\s+is\s+', sql_clean, re.I):
@@ -866,11 +893,13 @@ def process(files_list, queries, max_passes=6):
     totals = defaultdict(int)
     source_pairs = {(q['source_table'], q['source_field']) for q in queries}
     for name, content in files_list:
-        sql_clean = strip_comments(content)
+        sql_clean = SQL_CLEAN_CACHE.get(name)
+        if sql_clean is None:
+            sql_clean = strip_comments(content)
         pass_count = max_passes if needs_multi_pass(sql_clean, source_pairs) else 1
         print(f"Processing: {name} (passes: {pass_count})")
         for _ in range(pass_count):
-            stats = parse_sql(content, g)
+            stats = parse_sql(content, g, sql_clean)
             for k, v in stats.items():
                 totals[k] += v
     print(f"\nTotals: {dict(totals)}")
