@@ -3,47 +3,19 @@
 # Properly handles nested subqueries and temp table chains
 # ==============================================================================
 
-from google.colab import files as colab_files
 import json
 import os
 import re
 import csv
 import zipfile
+import sys
+import tempfile
+import uuid
 from collections import defaultdict, deque
 
 SQL_FILE_CACHE_ROOT = None
 SQL_FILE_CACHE_LIST = None
 SQL_CLEAN_CACHE = {}
-
-print("=" * 70)
-print("STEP 1: Upload mappings.json")
-print("=" * 70)
-uploaded_mappings = colab_files.upload()
-with open('/content/mappings.json', 'wb') as f:
-    f.write(list(uploaded_mappings.values())[0])
-print("✅ mappings.json uploaded")
-
-print("\n" + "=" * 70)
-print("STEP 2: Upload SQL ZIP file")
-print("=" * 70)
-uploaded_sql = colab_files.upload()
-zip_name = list(uploaded_sql.keys())[0]
-with open(f'/content/{zip_name}', 'wb') as f:
-    f.write(list(uploaded_sql.values())[0])
-
-extract_path = '/content/sql_files'
-os.makedirs(extract_path, exist_ok=True)
-with zipfile.ZipFile(f'/content/{zip_name}', 'r') as z:
-    z.extractall(extract_path)
-
-# Reset caches after new extraction
-SQL_FILE_CACHE_ROOT = None
-SQL_FILE_CACHE_LIST = None
-SQL_CLEAN_CACHE = {}
-
-sql_count = sum(1 for root, dirs, files in os.walk(extract_path) 
-                for f in files if f.lower().endswith('.sql'))
-print(f"✅ Extracted {sql_count} SQL files")
 
 # ==============================================================================
 # PARSER CODE - WORKING VERSION
@@ -53,6 +25,18 @@ def strip_comments(sql):
     sql = re.sub(r'/\*.*?\*/', ' ', sql, flags=re.S)
     sql = re.sub(r'--.*?\n', '\n', sql)
     return sql
+
+def reset_sql_cache():
+    global SQL_FILE_CACHE_ROOT, SQL_FILE_CACHE_LIST, SQL_CLEAN_CACHE
+    SQL_FILE_CACHE_ROOT = None
+    SQL_FILE_CACHE_LIST = None
+    SQL_CLEAN_CACHE = {}
+
+def extract_zip(zip_path, extract_path):
+    os.makedirs(extract_path, exist_ok=True)
+    with zipfile.ZipFile(zip_path, 'r') as z:
+        z.extractall(extract_path)
+    reset_sql_cache()
 
 def norm(s):
     if s is None:
@@ -942,79 +926,157 @@ def get_longest_path_only(paths):
         kept.append(p)
     return kept
 
-# ==============================================================================
-# RUN ANALYSIS
-# ==============================================================================
+def run_analysis(mappings_path, sql_root, output_path, max_passes=None):
+    print("\n" + "=" * 70)
+    print("STEP 3: Running analysis")
+    print("=" * 70)
 
-print("\n" + "=" * 70)
-print("STEP 3: Running analysis")
-print("=" * 70)
+    files_list = read_files(sql_root, use_cache=True)
+    print(f"\nFound {len(files_list)} SQL file(s)")
+    queries = load_maps(mappings_path)
+    g = process(files_list, queries, max_passes=max_passes or 6)
 
-files_list = read_files('/content/sql_files')
-print(f"\nFound {len(files_list)} SQL file(s)")
-queries = load_maps('/content/mappings.json')
-g = process(files_list, queries)
+    with open(output_path, 'w', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(
+            f,
+            fieldnames=['src_tbl', 'src_col', 'dst_tbl', 'dst_col', 'found',
+                        'longest_path', 'length', 'inter', 'alts']
+        )
+        w.writeheader()
 
-out_file = '/content/mapping_results.csv'
-with open(out_file, 'w', newline='', encoding='utf-8') as f:
-    w = csv.DictWriter(f, fieldnames=['src_tbl', 'src_col', 'dst_tbl', 'dst_col', 'found', 'longest_path', 'length', 'inter', 'alts'])
-    w.writeheader()
+        print(f"\n{'='*70}")
+        print("RESULTS")
+        print('='*70)
+
+        for q in queries:
+            src = node(q['source_table'], q['source_field'])
+
+            # Get all paths to the destination
+            all_paths = g.get_all_paths_to_dest(src, q['dest_table'], q['dest_field'])
+
+            # Filter to keep only longest path for each end node
+            longest_paths = get_longest_path_only(all_paths)
+
+            found = len(longest_paths) > 0
+
+            # Get the longest path overall
+            if longest_paths:
+                longest = max(longest_paths, key=len)
+            else:
+                longest = []
+
+            inters = [n for n in longest[1:-1] if '.' not in n or '[' in n] if longest else []
+
+            # Always report alternative paths to other destinations
+            alts = []
+            all_reachable = g.all_destinations(src)
+            target_end = node(q['dest_table'], q['dest_field'])
+            other_paths = [p for p in all_reachable if p and p[-1] != target_end]
+            if other_paths:
+                other_longest = get_longest_path_only(other_paths)
+                alts = [fmt(p) for p in sorted(other_longest, key=len, reverse=True)]
+
+            alts_str = '|||'.join(alts)
+
+            w.writerow({
+                'src_tbl': q['source_table'], 'src_col': q['source_field'],
+                'dst_tbl': q['dest_table'], 'dst_col': q['dest_field'],
+                'found': found, 'longest_path': fmt(longest), 'length': len(longest),
+                'inter': ','.join(inters), 'alts': alts_str
+            })
+
+            print(f"\n{q['source_table']}.{q['source_field']} → {q['dest_table']}.{q['dest_field']}")
+            print(f"  Found: {found}")
+            if found:
+                print(f"  ✅ Longest path ({len(longest)} nodes): {fmt(longest)}")
+            elif alts_str:
+                print("  ❌ No direct path to target")
+                print("  Alternative paths found:")
+                for a in alts_str.split('|||')[:3]:
+                    print(f"    → {a}")
+            else:
+                print("  ❌ No path found")
 
     print(f"\n{'='*70}")
-    print("RESULTS")
+    print(f"✅ Results: {output_path}")
     print('='*70)
+    return output_path
 
-    for q in queries:
-        src, dst = node(q['source_table'], q['source_field']), node(q['dest_table'], q['dest_field'])
+def resolve_mappings_blob(bucket, zip_blob_name):
+    env_blob = os.environ.get('MAPPINGS_BLOB')
+    if env_blob and bucket.get_blob(env_blob):
+        return env_blob
 
-        # Get all paths to the destination
-        all_paths = g.get_all_paths_to_dest(src, q['dest_table'], q['dest_field'])
+    dir_prefix = os.path.dirname(zip_blob_name)
+    if dir_prefix:
+        candidate = f"{dir_prefix}/mappings.json"
+    else:
+        candidate = "mappings.json"
+    if bucket.get_blob(candidate):
+        return candidate
 
-        # Filter to keep only longest path for each end node
-        longest_paths = get_longest_path_only(all_paths)
+    base = os.path.splitext(zip_blob_name)[0]
+    candidate = f"{base}.mappings.json"
+    if bucket.get_blob(candidate):
+        return candidate
 
-        found = len(longest_paths) > 0
+    raise FileNotFoundError("mappings.json not found in bucket")
 
-        # Get the longest path overall
-        if longest_paths:
-            longest = max(longest_paths, key=len)
-        else:
-            longest = []
+def gcs_mapping_handler(event, context):
+    from google.cloud import storage
 
-        inters = [n for n in longest[1:-1] if '.' not in n or '[' in n] if longest else []
+    bucket_name = event.get('bucket')
+    blob_name = event.get('name', '')
+    if not bucket_name or not blob_name:
+        print("Missing bucket or object name in event.")
+        return
+    if not blob_name.lower().endswith('.zip'):
+        print(f"Skipping non-zip object: {blob_name}")
+        return
 
-        # Always report alternative paths to other destinations
-        alts = []
-        all_reachable = g.all_destinations(src)
-        target_end = node(q['dest_table'], q['dest_field'])
-        other_paths = [p for p in all_reachable if p and p[-1] != target_end]
-        if other_paths:
-            other_longest = get_longest_path_only(other_paths)
-            alts = [fmt(p) for p in sorted(other_longest, key=len, reverse=True)]
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    zip_blob = bucket.blob(blob_name)
 
-        alts_str = '|||'.join(alts)
+    work_dir = tempfile.mkdtemp(prefix="sql_run_")
+    zip_path = os.path.join(work_dir, "sql.zip")
+    extract_path = os.path.join(work_dir, "sql_files")
+    mappings_path = os.path.join(work_dir, "mappings.json")
+    output_path = os.path.join(work_dir, "mapping_results.csv")
 
-        w.writerow({
-            'src_tbl': q['source_table'], 'src_col': q['source_field'],
-            'dst_tbl': q['dest_table'], 'dst_col': q['dest_field'],
-            'found': found, 'longest_path': fmt(longest), 'length': len(longest),
-            'inter': ','.join(inters), 'alts': alts_str
-        })
+    zip_blob.download_to_filename(zip_path)
+    extract_zip(zip_path, extract_path)
 
-        print(f"\n{q['source_table']}.{q['source_field']} → {q['dest_table']}.{q['dest_field']}")
-        print(f"  Found: {found}")
-        if found:
-            print(f"  ✅ Longest path ({len(longest)} nodes): {fmt(longest)}")
-        elif alts_str:
-            print("  ❌ No direct path to target")
-            print("  Alternative paths found:")
-            for a in alts_str.split('|||')[:3]:
-                print(f"    → {a}")
-        else:
-            print("  ❌ No path found")
+    mappings_blob_name = resolve_mappings_blob(bucket, blob_name)
+    bucket.blob(mappings_blob_name).download_to_filename(mappings_path)
 
-print(f"\n{'='*70}")
-print(f"✅ Results: {out_file}")
-print('='*70)
+    max_passes = int(os.environ.get("MAX_PASSES", "6"))
+    run_analysis(mappings_path, extract_path, output_path, max_passes=max_passes)
 
-colab_files.download(out_file)
+    output_prefix = os.environ.get("OUTPUT_PREFIX", "outputs")
+    output_bucket = os.environ.get("OUTPUT_BUCKET", bucket_name)
+    base = os.path.splitext(os.path.basename(blob_name))[0]
+    output_blob_name = os.environ.get(
+        "OUTPUT_BLOB",
+        f"{output_prefix}/{base}_mapping_results.csv"
+    )
+    client.bucket(output_bucket).blob(output_blob_name).upload_from_filename(output_path)
+    print(f"Uploaded results to gs://{output_bucket}/{output_blob_name}")
+
+def main():
+    mappings_path = os.environ.get("MAPPINGS_PATH")
+    zip_path = os.environ.get("SQL_ZIP_PATH")
+    output_path = os.environ.get("OUTPUT_PATH", "mapping_results.csv")
+    max_passes = int(os.environ.get("MAX_PASSES", "6"))
+
+    if not mappings_path or not zip_path:
+        print("Set MAPPINGS_PATH and SQL_ZIP_PATH to run locally.")
+        sys.exit(1)
+
+    work_dir = tempfile.mkdtemp(prefix="sql_run_")
+    extract_path = os.path.join(work_dir, "sql_files")
+    extract_zip(zip_path, extract_path)
+    run_analysis(mappings_path, extract_path, output_path, max_passes=max_passes)
+
+if __name__ == "__main__":
+    main()
