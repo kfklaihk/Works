@@ -1027,6 +1027,7 @@ def gcs_mapping_handler(event, context):
 
     bucket_name = event.get('bucket')
     blob_name = event.get('name', '')
+    generation = event.get('generation')
     if not bucket_name or not blob_name:
         print("Missing bucket or object name in event.")
         return
@@ -1037,6 +1038,29 @@ def gcs_mapping_handler(event, context):
     client = storage.Client()
     bucket = client.bucket(bucket_name)
     zip_blob = bucket.blob(blob_name)
+
+    output_prefix = os.environ.get("OUTPUT_PREFIX", "outputs")
+    output_bucket = os.environ.get("OUTPUT_BUCKET", bucket_name)
+    base = os.path.splitext(os.path.basename(blob_name))[0]
+    output_blob_name = os.environ.get(
+        "OUTPUT_BLOB",
+        f"{output_prefix}/{base}_mapping_results.csv"
+    )
+
+    force_run = os.environ.get("FORCE_RUN", "").lower() in ("1", "true", "yes")
+    output_bucket_obj = client.bucket(output_bucket)
+    output_blob = output_bucket_obj.blob(output_blob_name)
+    if output_blob.exists() and not force_run:
+        output_blob.reload()
+        prev_gen = None
+        if output_blob.metadata:
+            prev_gen = output_blob.metadata.get("input_generation")
+        if generation and prev_gen == generation:
+            print(f"Output already exists for generation {generation}; skipping.")
+            return
+        if not generation:
+            print("Output already exists and no generation provided; skipping.")
+            return
 
     work_dir = tempfile.mkdtemp(prefix="sql_run_")
     zip_path = os.path.join(work_dir, "sql.zip")
@@ -1053,14 +1077,12 @@ def gcs_mapping_handler(event, context):
     max_passes = int(os.environ.get("MAX_PASSES", "6"))
     run_analysis(mappings_path, extract_path, output_path, max_passes=max_passes)
 
-    output_prefix = os.environ.get("OUTPUT_PREFIX", "outputs")
-    output_bucket = os.environ.get("OUTPUT_BUCKET", bucket_name)
-    base = os.path.splitext(os.path.basename(blob_name))[0]
-    output_blob_name = os.environ.get(
-        "OUTPUT_BLOB",
-        f"{output_prefix}/{base}_mapping_results.csv"
-    )
-    client.bucket(output_bucket).blob(output_blob_name).upload_from_filename(output_path)
+    output_blob.metadata = {
+        "input_bucket": bucket_name,
+        "input_object": blob_name,
+        "input_generation": generation or "",
+    }
+    output_blob.upload_from_filename(output_path)
     print(f"Uploaded results to gs://{output_bucket}/{output_blob_name}")
 
 def main():

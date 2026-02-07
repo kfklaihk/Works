@@ -52,3 +52,9 @@ gs://YOUR_BUCKET_NAME/outputs/<zip_basename>_mapping_results.csv
 - `OUTPUT_PREFIX`: prefix for output CSV objects (default `outputs`)
 - `OUTPUT_BUCKET`: override output bucket
 - `MAX_PASSES`: per-file parse passes (default `6`)
+- `FORCE_RUN`: set to `true` to bypass idempotency checks
+
+## Idempotency
+The function skips processing if the output CSV already exists **for the same input
+generation**. This avoids duplicate work when Eventarc delivers duplicate events.
+To force reprocessing, set `FORCE_RUN=true` or delete the existing output file.
