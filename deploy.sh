@@ -16,6 +16,7 @@ BUCKET="${BUCKET:-}"
 MAPPINGS_BLOB="${MAPPINGS_BLOB:-}"
 OUTPUT_PREFIX="${OUTPUT_PREFIX:-outputs}"
 MAX_PASSES="${MAX_PASSES:-6}"
+PATH_PATTERN="${PATH_PATTERN:-inputs/*.zip}"
 
 if [[ -z "${PROJECT_ID}" ]]; then
   echo "PROJECT_ID is required"
@@ -46,6 +47,7 @@ gcloud functions deploy sql_mapping_runner \
   --entry-point=gcs_mapping_handler \
   --trigger-event-filters="type=google.cloud.storage.object.v1.finalized" \
   --trigger-event-filters="bucket=${BUCKET}" \
+  --trigger-event-filters-path-pattern="objectName=${PATH_PATTERN}" \
   --set-env-vars="MAPPINGS_BLOB=${MAPPINGS_BLOB},OUTPUT_PREFIX=${OUTPUT_PREFIX},MAX_PASSES=${MAX_PASSES}"
 
 SA="${PROJECT_ID}@appspot.gserviceaccount.com"

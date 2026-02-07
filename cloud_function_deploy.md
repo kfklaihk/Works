@@ -32,6 +32,7 @@ BUCKET=YOUR_BUCKET_NAME \
 MAPPINGS_BLOB=inputs/mappings.json \
 OUTPUT_PREFIX=outputs \
 MAX_PASSES=6 \
+PATH_PATTERN=inputs/*.zip \
 ./deploy.sh
 ```
 
@@ -52,6 +53,7 @@ gs://YOUR_BUCKET_NAME/outputs/<zip_basename>_mapping_results.csv
 - `OUTPUT_PREFIX`: prefix for output CSV objects (default `outputs`)
 - `OUTPUT_BUCKET`: override output bucket
 - `MAX_PASSES`: per-file parse passes (default `6`)
+- `PATH_PATTERN`: GCS object name glob for triggers (default `inputs/*.zip`)
 - `FORCE_RUN`: set to `true` to bypass idempotency checks
 
 ## Idempotency
