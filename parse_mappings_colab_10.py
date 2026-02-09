@@ -3,38 +3,19 @@
 # Properly handles nested subqueries and temp table chains
 # ==============================================================================
 
-from google.colab import files as colab_files
 import json
 import os
 import re
 import csv
 import zipfile
+import sys
+import tempfile
+import uuid
 from collections import defaultdict, deque
 
-print("=" * 70)
-print("STEP 1: Upload mappings.json")
-print("=" * 70)
-uploaded_mappings = colab_files.upload()
-with open('/content/mappings.json', 'wb') as f:
-    f.write(list(uploaded_mappings.values())[0])
-print("✅ mappings.json uploaded")
-
-print("\n" + "=" * 70)
-print("STEP 2: Upload SQL ZIP file")
-print("=" * 70)
-uploaded_sql = colab_files.upload()
-zip_name = list(uploaded_sql.keys())[0]
-with open(f'/content/{zip_name}', 'wb') as f:
-    f.write(list(uploaded_sql.values())[0])
-
-extract_path = '/content/sql_files'
-os.makedirs(extract_path, exist_ok=True)
-with zipfile.ZipFile(f'/content/{zip_name}', 'r') as z:
-    z.extractall(extract_path)
-
-sql_count = sum(1 for root, dirs, files in os.walk(extract_path) 
-                for f in files if f.lower().endswith('.sql'))
-print(f"✅ Extracted {sql_count} SQL files")
+SQL_FILE_CACHE_ROOT = None
+SQL_FILE_CACHE_LIST = None
+SQL_CLEAN_CACHE = {}
 
 # ==============================================================================
 # PARSER CODE - WORKING VERSION
@@ -45,8 +26,22 @@ def strip_comments(sql):
     sql = re.sub(r'--.*?\n', '\n', sql)
     return sql
 
+def reset_sql_cache():
+    global SQL_FILE_CACHE_ROOT, SQL_FILE_CACHE_LIST, SQL_CLEAN_CACHE
+    SQL_FILE_CACHE_ROOT = None
+    SQL_FILE_CACHE_LIST = None
+    SQL_CLEAN_CACHE = {}
+
+def extract_zip(zip_path, extract_path):
+    os.makedirs(extract_path, exist_ok=True)
+    with zipfile.ZipFile(zip_path, 'r') as z:
+        z.extractall(extract_path)
+    reset_sql_cache()
+
 def norm(s):
-    return s.strip().strip('"').lower()
+    if s is None:
+        return ""
+    return str(s).strip().strip('"').lower()
 
 def node(t, c):
     return f"{norm(t)}.{norm(c)}"
@@ -212,6 +207,78 @@ def split_select_from(sql):
     from_clause = sql[from_idx + len('from'):].strip()
     return select_clause, from_clause
 
+def split_conditions(s):
+    parts, depth, cur = [], 0, ""
+    i = 0
+    s_len = len(s)
+    while i < s_len:
+        c = s[i]
+        if c == '(':
+            depth += 1
+            cur += c
+        elif c == ')':
+            depth -= 1
+            cur += c
+        elif depth == 0 and s[i:i+3].lower() == 'and' and (i == 0 or not s[i-1].isalnum()):
+            parts.append(cur.strip())
+            cur = ""
+            i += 3
+            continue
+        else:
+            cur += c
+        i += 1
+    if cur.strip():
+        parts.append(cur.strip())
+    return parts
+
+def parse_join_conditions(from_clause, table_aliases, subquery_aliases, default_alias, graph, stats):
+    join_cols_by_alias = defaultdict(set)
+    on_pattern = re.compile(r'\bon\b\s+([\s\S]*?)(?=\b(join|where|group|order|union|having|$))', re.I)
+    for on_match in on_pattern.finditer(from_clause):
+        cond_block = on_match.group(1)
+        for cond in split_conditions(cond_block):
+            if not cond:
+                continue
+            eq_parts = cond.split('=')
+            if len(eq_parts) != 2:
+                continue
+            left = eq_parts[0].strip()
+            right = eq_parts[1].strip()
+
+            m_left = re.match(r'([a-z][a-z0-9_]*)\.([a-z][a-z0-9_]*)$', left, re.I)
+            m_right = re.match(r'([a-z][a-z0-9_]*)\.([a-z][a-z0-9_]*)$', right, re.I)
+
+            if m_left and not m_right:
+                alias, col = m_left.group(1).lower(), m_left.group(2).lower()
+                out_col, sources = resolve_expr_sources(
+                    right, table_aliases, subquery_aliases, graph, stats, default_alias
+                )
+                if sources:
+                    for src in sources:
+                        graph.edge(src, f"{alias}.{col}")
+                        stats['join_cond'] += 1
+                    join_cols_by_alias[alias].add(col)
+            elif m_right and not m_left:
+                alias, col = m_right.group(1).lower(), m_right.group(2).lower()
+                out_col, sources = resolve_expr_sources(
+                    left, table_aliases, subquery_aliases, graph, stats, default_alias
+                )
+                if sources:
+                    for src in sources:
+                        graph.edge(src, f"{alias}.{col}")
+                        stats['join_cond'] += 1
+                    join_cols_by_alias[alias].add(col)
+            elif m_left and m_right:
+                l_alias, l_col = m_left.group(1).lower(), m_left.group(2).lower()
+                r_alias, r_col = m_right.group(1).lower(), m_right.group(2).lower()
+                graph.edge(f"{r_alias}.{r_col}", f"{l_alias}.{l_col}")
+                graph.edge(f"{l_alias}.{l_col}", f"{r_alias}.{r_col}")
+                join_cols_by_alias[l_alias].add(l_col)
+                join_cols_by_alias[r_alias].add(r_col)
+                stats['join_cond'] += 2
+
+    return join_cols_by_alias
+
 def parse_from_clause(from_clause, graph, stats):
     table_aliases = {}
     subquery_aliases = {}
@@ -348,6 +415,16 @@ def resolve_expr_sources(expr, table_aliases, subquery_aliases, graph, stats, de
 
     return None, set()
 
+def strip_select_alias(expr):
+    expr_clean = expr.strip()
+    m = re.match(r'(.+?)\s+as\s+[a-z0-9_]+$', expr_clean, re.I | re.S)
+    if m:
+        return m.group(1).strip()
+    m = re.match(r'(.+?)\s+[a-z0-9_]+$', expr_clean, re.I | re.S)
+    if m:
+        return m.group(1).strip()
+    return expr_clean
+
 def parse_select_mapping(sql, graph, stats):
     mapping = defaultdict(set)
     for part in split_union_all(sql):
@@ -361,6 +438,9 @@ def parse_select_mapping(sql, graph, stats):
                 default_alias = next(iter(subquery_aliases))
             elif len(table_aliases) == 1:
                 default_alias = next(iter(table_aliases))
+        join_cols_by_alias = parse_join_conditions(
+            from_clause, table_aliases, subquery_aliases, default_alias, graph, stats
+        )
         exprs = split_paren(select_clause)
         for expr in exprs:
             out_col, sources = resolve_expr_sources(
@@ -368,17 +448,38 @@ def parse_select_mapping(sql, graph, stats):
             )
             if out_col and sources:
                 mapping[out_col].update(sources)
+            expr_body = strip_select_alias(expr)
+            m = re.match(r'\s*([a-z][a-z0-9_]*)\.([a-z][a-z0-9_]*)\s*$', expr_body, re.I)
+            if m:
+                alias, col = m.group(1).lower(), m.group(2).lower()
+                for join_col in join_cols_by_alias.get(alias, set()):
+                    if join_col != col:
+                        graph.edge(f"{alias}.{join_col}", f"{alias}.{col}")
+                        stats['join_to_select'] += 1
     return mapping
 
-def read_files(root):
+def read_files(root, use_cache=True):
+    global SQL_FILE_CACHE_ROOT, SQL_FILE_CACHE_LIST, SQL_CLEAN_CACHE
+    if use_cache and SQL_FILE_CACHE_ROOT == root and SQL_FILE_CACHE_LIST is not None:
+        return SQL_FILE_CACHE_LIST
+
     files_list = []
+    SQL_CLEAN_CACHE = {}
     for dp, _, fn in os.walk(root):
         for f in fn:
             if f.lower().endswith('.sql'):
+                full_path = os.path.join(dp, f)
                 try:
-                    with open(os.path.join(dp, f), 'r', encoding='utf-8', errors='ignore') as fh:
-                        files_list.append((f, fh.read()))
-                except: pass
+                    with open(full_path, 'r', encoding='utf-8', errors='ignore') as fh:
+                        content = fh.read()
+                        rel_path = os.path.relpath(full_path, root)
+                        files_list.append((rel_path, content))
+                        if use_cache:
+                            SQL_CLEAN_CACHE[rel_path] = strip_comments(content)
+                except:
+                    pass
+    SQL_FILE_CACHE_ROOT = root
+    SQL_FILE_CACHE_LIST = files_list
     return files_list
 
 def fmt(p):
@@ -398,12 +499,13 @@ def fmt(p):
             parts.append(f"{n}")
     return ' -> '.join(parts)
 
-def parse_insert_with_nested_subqueries(sql, graph, stats):
+def parse_insert_with_nested_subqueries(sql, graph, stats, sql_clean=None):
     """
     Parse INSERT...SELECT...FROM (subquery) alias patterns and build
     alias chains for nested subqueries.
     """
-    sql_clean = strip_comments(sql)
+    if sql_clean is None:
+        sql_clean = strip_comments(sql)
     pattern = r'insert\s+into\s+([a-z0-9_".]+)\s*\((.*?)\)\s*select\s+(.*?)\s+from\s*\('
 
     for m in re.finditer(pattern, sql_clean, re.I | re.S):
@@ -445,6 +547,79 @@ def parse_insert_with_nested_subqueries(sql, graph, stats):
                 graph.edge(f"{sub_alias}.{col}", dest_node)
                 stats['ins_subq'] += 1
 
+def parse_insert_select_statements(sql, graph, stats, sql_clean=None):
+    if sql_clean is None:
+        sql_clean = strip_comments(sql)
+    pattern = re.compile(r'insert\s+into\s+([a-z0-9_".]+)\s*\((.*?)\)\s*select\b', re.I | re.S)
+    for m in pattern.finditer(sql_clean):
+        dest_table = norm(m.group(1).split('.')[-1].strip('"'))
+        dest_cols = [norm(c) for c in split_paren(m.group(2))]
+        select_start = m.end() - len('select')
+        depth = 0
+        end_idx = None
+        for i in range(m.end(), len(sql_clean)):
+            c = sql_clean[i]
+            if c == '(':
+                depth += 1
+            elif c == ')':
+                depth -= 1
+            elif c == ';' and depth == 0:
+                end_idx = i
+                break
+        select_sql = sql_clean[select_start:end_idx].strip() if end_idx else sql_clean[select_start:].strip()
+        select_clause, from_clause = split_select_from(select_sql)
+        if not select_clause or not from_clause:
+            continue
+        table_aliases = {}
+        subquery_aliases = {}
+        primary_alias = None
+        join_cols_by_alias = defaultdict(set)
+        from_clause_stripped = from_clause.lstrip()
+        if from_clause_stripped.startswith('('):
+            end_idx = find_matching_paren(from_clause_stripped, 0)
+            if end_idx != -1:
+                sub_sql = from_clause_stripped[1:end_idx]
+                alias_match = re.match(r'\s*([a-z][a-z0-9_]*)', from_clause_stripped[end_idx + 1:], re.I)
+                if alias_match:
+                    alias = alias_match.group(1).lower()
+                    subquery_aliases[alias] = parse_select_mapping(sub_sql, graph, stats)
+                    primary_alias = alias
+                    join_cols_by_alias = parse_join_conditions(
+                        from_clause, table_aliases, subquery_aliases, primary_alias, graph, stats
+                    )
+                else:
+                    pseudo = "_subq"
+                    subquery_aliases[pseudo] = parse_select_mapping(sub_sql, graph, stats)
+                    primary_alias = pseudo
+        else:
+            table_aliases, subquery_aliases, primary_alias = parse_from_clause(from_clause, graph, stats)
+            join_cols_by_alias = parse_join_conditions(
+                from_clause, table_aliases, subquery_aliases, primary_alias, graph, stats
+            )
+        default_alias = primary_alias
+        if not default_alias:
+            if len(subquery_aliases) == 1:
+                default_alias = next(iter(subquery_aliases))
+            elif len(table_aliases) == 1:
+                default_alias = next(iter(table_aliases))
+        exprs = split_paren(select_clause)
+        for dest_col, expr in zip(dest_cols, exprs):
+            dest_node = node(dest_table, dest_col)
+            out_col, sources = resolve_expr_sources(
+                expr, table_aliases, subquery_aliases, graph, stats, default_alias
+            )
+            for src in sources:
+                graph.edge(src, dest_node)
+                stats['ins_select'] += 1
+            expr_body = strip_select_alias(expr)
+            m_expr = re.match(r'\s*([a-z][a-z0-9_]*)\.([a-z][a-z0-9_]*)\s*$', expr_body, re.I)
+            if m_expr:
+                alias, col = m_expr.group(1).lower(), m_expr.group(2).lower()
+                for join_col in join_cols_by_alias.get(alias, set()):
+                    if join_col != col:
+                        graph.edge(f"{alias}.{join_col}", f"{alias}.{col}")
+                        stats['join_to_select'] += 1
+
 def extract_alias_after_from(after_text):
     m = re.match(r'\s+([a-z][a-z0-9_]*)', after_text, re.I)
     if m:
@@ -484,11 +659,12 @@ def map_insert_select(sql_clean, dest_table, source_table, graph, stats,
                 graph.edge(node(source_table, sc), node(dest_table, dcol))
                 stats[stats_key or 'ins_select'] += 1
 
-def parse_temp_table_chains(sql, graph, stats):
+def parse_temp_table_chains(sql, graph, stats, sql_clean=None):
     """
     Parse chains like: dm_correlated_person -> cccp_ini_temp -> cccp_temp -> cmn_client_contact_person
     """
-    sql_clean = strip_comments(sql)
+    if sql_clean is None:
+        sql_clean = strip_comments(sql)
     map_insert_select(
         sql_clean, 'cccp_ini_temp', 'dm_correlated_person', graph, stats,
         dest_col='mbr_communication_type', source_col='mbr_communication_type',
@@ -559,17 +735,22 @@ def parse_if_assignments(sql_clean, graph, stats):
                         graph.var_sources[var] = src
                     stats['if_assign'] += 1
 
-def parse_sql(content, graph):
+def parse_sql(content, graph, sql_clean=None):
     stats = defaultdict(int)
 
+    if sql_clean is None:
+        sql_clean = strip_comments(content)
+
+    # Parse INSERT...SELECT statements (direct table sources)
+    parse_insert_select_statements(content, graph, stats, sql_clean)
+
     # Parse INSERT with nested subqueries (handles mapping 3)
-    parse_insert_with_nested_subqueries(content, graph, stats)
+    parse_insert_with_nested_subqueries(content, graph, stats, sql_clean)
 
     # Parse temp table chains (handles mapping 4)
-    parse_temp_table_chains(content, graph, stats)
+    parse_temp_table_chains(content, graph, stats, sql_clean)
 
     # Original parsing for cursor-based patterns
-    sql_clean = strip_comments(content)
 
     # Cursors
     for m in re.finditer(r'\bcursor\s+([a-z][a-z0-9_]*)\s+is\s+', sql_clean, re.I):
@@ -588,7 +769,8 @@ def parse_sql(content, graph):
             for t in re.finditer(r'from\s+([a-z][a-z0-9_]+)(?:\s+([a-z][a-z0-9_]*))?', body, re.I):
                 tbl, al = t.group(1).lower(), (t.group(2) or t.group(1)).lower()
                 aliases[al] = tbl
-        graph.cursor_defs[name] = {'aliases': aliases}
+        mapping = parse_select_mapping(body, graph, stats)
+        graph.cursor_defs[name] = {'aliases': aliases, 'mapping': mapping}
         graph.cursor_aliases[name] = aliases
 
     # FOR loops
@@ -634,11 +816,21 @@ def parse_sql(content, graph):
                 graph.edge(vlow, dst); stats['ins_var'] += 1
             elif '.' in vlow and not vlow.startswith('to_date') and not vlow.startswith('decode'):
                 for al, sc in extract_cols(val):
-                    src = node(all_al.get(al, al), sc)
                     if al in graph.loop_vars:
                         inter = f"{al}.{sc}"
-                        graph.edge(src, inter); graph.edge(inter, dst); stats['ins_loop'] += 1
+                        cursor_name = graph.loop_vars[al]['cursor']
+                        mapping = graph.cursor_defs.get(cursor_name, {}).get('mapping', {})
+                        sources = mapping.get(sc, set())
+                        if sources:
+                            for src in sources:
+                                graph.edge(src, inter)
+                        else:
+                            src = node(all_al.get(al, al), sc)
+                            graph.edge(src, inter)
+                        graph.edge(inter, dst)
+                        stats['ins_loop'] += 1
                     else:
+                        src = node(all_al.get(al, al), sc)
                         graph.edge(src, dst); stats['ins_col'] += 1
             elif 'to_date(' in vlow:
                 for al, sc in extract_cols(val):
@@ -680,16 +872,18 @@ def needs_multi_pass(sql_text, source_pairs):
             return True
     return False
 
-def process(files_list, queries, max_passes=5):
+def process(files_list, queries, max_passes=6):
     g = Graph()
     totals = defaultdict(int)
     source_pairs = {(q['source_table'], q['source_field']) for q in queries}
     for name, content in files_list:
-        sql_clean = strip_comments(content)
+        sql_clean = SQL_CLEAN_CACHE.get(name)
+        if sql_clean is None:
+            sql_clean = strip_comments(content)
         pass_count = max_passes if needs_multi_pass(sql_clean, source_pairs) else 1
         print(f"Processing: {name} (passes: {pass_count})")
         for _ in range(pass_count):
-            stats = parse_sql(content, g)
+            stats = parse_sql(content, g, sql_clean)
             for k, v in stats.items():
                 totals[k] += v
     print(f"\nTotals: {dict(totals)}")
@@ -732,80 +926,179 @@ def get_longest_path_only(paths):
         kept.append(p)
     return kept
 
-# ==============================================================================
-# RUN ANALYSIS
-# ==============================================================================
+def run_analysis(mappings_path, sql_root, output_path, max_passes=None):
+    print("\n" + "=" * 70)
+    print("STEP 3: Running analysis")
+    print("=" * 70)
 
-print("\n" + "=" * 70)
-print("STEP 3: Running analysis")
-print("=" * 70)
+    files_list = read_files(sql_root, use_cache=True)
+    print(f"\nFound {len(files_list)} SQL file(s)")
+    queries = load_maps(mappings_path)
+    g = process(files_list, queries, max_passes=max_passes or 6)
 
-files_list = read_files('/content/sql_files')
-print(f"\nFound {len(files_list)} SQL file(s)")
-queries = load_maps('/content/mappings.json')
-g = process(files_list, queries)
+    with open(output_path, 'w', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(
+            f,
+            fieldnames=['src_tbl', 'src_col', 'dst_tbl', 'dst_col', 'found',
+                        'longest_path', 'length', 'inter', 'alts']
+        )
+        w.writeheader()
 
-out_file = '/content/mapping_results.csv'
-with open(out_file, 'w', newline='', encoding='utf-8') as f:
-    w = csv.DictWriter(f, fieldnames=['src_tbl', 'src_col', 'dst_tbl', 'dst_col', 'found', 'longest_path', 'length', 'inter', 'alts'])
-    w.writeheader()
+        print(f"\n{'='*70}")
+        print("RESULTS")
+        print('='*70)
 
-    print(f"\n{'='*70}")
-    print("RESULTS")
-    print('='*70)
+        for q in queries:
+            src = node(q['source_table'], q['source_field'])
 
-    for q in queries:
-        src, dst = node(q['source_table'], q['source_field']), node(q['dest_table'], q['dest_field'])
+            # Get all paths to the destination
+            all_paths = g.get_all_paths_to_dest(src, q['dest_table'], q['dest_field'])
 
-        # Get all paths to the destination
-        all_paths = g.get_all_paths_to_dest(src, q['dest_table'], q['dest_field'])
+            # Filter to keep only longest path for each end node
+            longest_paths = get_longest_path_only(all_paths)
 
-        # Filter to keep only longest path for each end node
-        longest_paths = get_longest_path_only(all_paths)
+            found = len(longest_paths) > 0
 
-        found = len(longest_paths) > 0
+            # Get the longest path overall
+            if longest_paths:
+                longest = max(longest_paths, key=len)
+            else:
+                longest = []
 
-        # Get the longest path overall
-        if longest_paths:
-            longest = max(longest_paths, key=len)
-        else:
-            longest = []
+            inters = [n for n in longest[1:-1] if '.' not in n or '[' in n] if longest else []
 
-        inters = [n for n in longest[1:-1] if '.' not in n or '[' in n] if longest else []
-
-        # For alternatives, find other paths that don't end at the target
-        alts = []
-        if not found:
+            # Always report alternative paths to other destinations
+            alts = []
             all_reachable = g.all_destinations(src)
             target_end = node(q['dest_table'], q['dest_field'])
             other_paths = [p for p in all_reachable if p and p[-1] != target_end]
             if other_paths:
                 other_longest = get_longest_path_only(other_paths)
-                alts = [fmt(p) for p in sorted(other_longest, key=len, reverse=True)[:5]]
+                alts = [fmt(p) for p in sorted(other_longest, key=len, reverse=True)]
 
-        alts_str = '|||'.join(alts)
+            alts_str = '|||'.join(alts)
 
-        w.writerow({
-            'src_tbl': q['source_table'], 'src_col': q['source_field'],
-            'dst_tbl': q['dest_table'], 'dst_col': q['dest_field'],
-            'found': found, 'longest_path': fmt(longest), 'length': len(longest),
-            'inter': ','.join(inters), 'alts': alts_str
-        })
+            w.writerow({
+                'src_tbl': q['source_table'], 'src_col': q['source_field'],
+                'dst_tbl': q['dest_table'], 'dst_col': q['dest_field'],
+                'found': found, 'longest_path': fmt(longest), 'length': len(longest),
+                'inter': ','.join(inters), 'alts': alts_str
+            })
 
-        print(f"\n{q['source_table']}.{q['source_field']} → {q['dest_table']}.{q['dest_field']}")
-        print(f"  Found: {found}")
-        if found:
-            print(f"  ✅ Longest path ({len(longest)} nodes): {fmt(longest)}")
-        elif alts_str:
-            print("  ❌ No direct path to target")
-            print("  Alternative paths found:")
-            for a in alts_str.split('|||')[:3]: 
-                print(f"    → {a}")
-        else:
-            print("  ❌ No path found")
+            print(f"\n{q['source_table']}.{q['source_field']} → {q['dest_table']}.{q['dest_field']}")
+            print(f"  Found: {found}")
+            if found:
+                print(f"  ✅ Longest path ({len(longest)} nodes): {fmt(longest)}")
+            elif alts_str:
+                print("  ❌ No direct path to target")
+                print("  Alternative paths found:")
+                for a in alts_str.split('|||')[:3]:
+                    print(f"    → {a}")
+            else:
+                print("  ❌ No path found")
 
-print(f"\n{'='*70}")
-print(f"✅ Results: {out_file}")
-print('='*70)
+    print(f"\n{'='*70}")
+    print(f"✅ Results: {output_path}")
+    print('='*70)
+    return output_path
 
-colab_files.download(out_file)
+def resolve_mappings_blob(bucket, zip_blob_name):
+    env_blob = os.environ.get('MAPPINGS_BLOB')
+    if env_blob and bucket.get_blob(env_blob):
+        return env_blob
+
+    dir_prefix = os.path.dirname(zip_blob_name)
+    if dir_prefix:
+        candidate = f"{dir_prefix}/mappings.json"
+    else:
+        candidate = "mappings.json"
+    if bucket.get_blob(candidate):
+        return candidate
+
+    base = os.path.splitext(zip_blob_name)[0]
+    candidate = f"{base}.mappings.json"
+    if bucket.get_blob(candidate):
+        return candidate
+
+    raise FileNotFoundError("mappings.json not found in bucket")
+
+def gcs_mapping_handler(event, context):
+    from google.cloud import storage
+
+    bucket_name = event.get('bucket')
+    blob_name = event.get('name', '')
+    generation = event.get('generation')
+    if not bucket_name or not blob_name:
+        print("Missing bucket or object name in event.")
+        return
+    if not blob_name.lower().endswith('.zip'):
+        print(f"Skipping non-zip object: {blob_name}")
+        return
+
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    zip_blob = bucket.blob(blob_name)
+
+    output_prefix = os.environ.get("OUTPUT_PREFIX", "outputs")
+    output_bucket = os.environ.get("OUTPUT_BUCKET", bucket_name)
+    base = os.path.splitext(os.path.basename(blob_name))[0]
+    output_blob_name = os.environ.get(
+        "OUTPUT_BLOB",
+        f"{output_prefix}/{base}_mapping_results.csv"
+    )
+
+    force_run = os.environ.get("FORCE_RUN", "").lower() in ("1", "true", "yes")
+    output_bucket_obj = client.bucket(output_bucket)
+    output_blob = output_bucket_obj.blob(output_blob_name)
+    if output_blob.exists() and not force_run:
+        output_blob.reload()
+        prev_gen = None
+        if output_blob.metadata:
+            prev_gen = output_blob.metadata.get("input_generation")
+        if generation and prev_gen == generation:
+            print(f"Output already exists for generation {generation}; skipping.")
+            return
+        if not generation:
+            print("Output already exists and no generation provided; skipping.")
+            return
+
+    work_dir = tempfile.mkdtemp(prefix="sql_run_")
+    zip_path = os.path.join(work_dir, "sql.zip")
+    extract_path = os.path.join(work_dir, "sql_files")
+    mappings_path = os.path.join(work_dir, "mappings.json")
+    output_path = os.path.join(work_dir, "mapping_results.csv")
+
+    zip_blob.download_to_filename(zip_path)
+    extract_zip(zip_path, extract_path)
+
+    mappings_blob_name = resolve_mappings_blob(bucket, blob_name)
+    bucket.blob(mappings_blob_name).download_to_filename(mappings_path)
+
+    max_passes = int(os.environ.get("MAX_PASSES", "6"))
+    run_analysis(mappings_path, extract_path, output_path, max_passes=max_passes)
+
+    output_blob.metadata = {
+        "input_bucket": bucket_name,
+        "input_object": blob_name,
+        "input_generation": generation or "",
+    }
+    output_blob.upload_from_filename(output_path)
+    print(f"Uploaded results to gs://{output_bucket}/{output_blob_name}")
+
+def main():
+    mappings_path = os.environ.get("MAPPINGS_PATH")
+    zip_path = os.environ.get("SQL_ZIP_PATH")
+    output_path = os.environ.get("OUTPUT_PATH", "mapping_results.csv")
+    max_passes = int(os.environ.get("MAX_PASSES", "6"))
+
+    if not mappings_path or not zip_path:
+        print("Set MAPPINGS_PATH and SQL_ZIP_PATH to run locally.")
+        sys.exit(1)
+
+    work_dir = tempfile.mkdtemp(prefix="sql_run_")
+    extract_path = os.path.join(work_dir, "sql_files")
+    extract_zip(zip_path, extract_path)
+    run_analysis(mappings_path, extract_path, output_path, max_passes=max_passes)
+
+if __name__ == "__main__":
+    main()
