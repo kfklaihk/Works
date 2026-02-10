@@ -75,10 +75,25 @@ class Graph:
         self.loop_vars = {}
         self.var_sources = {}
         self.cursor_defs = {}
+        self.edge_sources = defaultdict(lambda: defaultdict(set))  # edge_sources[src][dst] = set of file names
+        self.current_file = None  # Track current file being processed
 
-    def edge(self, s, d):
+    def edge(self, s, d, source_file=None):
         self.nodes.update([s, d])
         self.adj[s].add(d)
+        # Use provided source_file or fall back to current_file
+        file_to_use = source_file or self.current_file
+        if file_to_use:
+            self.edge_sources[s][d].add(file_to_use)
+    
+    def get_source_files_for_path(self, path):
+        """Get all source files involved in a path"""
+        files = set()
+        for i in range(len(path) - 1):
+            src, dst = path[i], path[i+1]
+            if src in self.edge_sources and dst in self.edge_sources[src]:
+                files.update(self.edge_sources[src][dst])
+        return files
 
     def paths(self, start, goal, max_d=30):
         res, q = [], deque([(start, [start])])
@@ -371,6 +386,41 @@ def parse_from_clause(from_clause, graph, stats):
     return table_aliases, subquery_aliases, primary_alias
 
 
+def extract_cols_from_functions(expr):
+    """
+    Extract column references from Oracle SQL functions like:
+    - TO_CHAR(col), TO_DATE(col), TO_NUMBER(col)
+    - NVL(col1, col2), NVL2(col1, val1, val2)
+    - DECODE(col, ...)
+    - SUBSTR(col, ...), TRIM(col), UPPER(col), LOWER(col)
+    - COALESCE(col1, col2, ...)
+    - etc.
+    Returns list of (alias, column) tuples and unqualified columns
+    """
+    cols = []
+    
+    # Common Oracle functions that wrap columns
+    func_patterns = [
+        r'(?:to_char|to_date|to_number|upper|lower|trim|ltrim|rtrim|substr|length|instr)\s*\(\s*([a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)?)',
+        r'nvl\s*\(\s*([a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)?)\s*,',
+        r'nvl2\s*\(\s*([a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)?)\s*,',
+        r'decode\s*\(\s*([a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)?)',
+        r'coalesce\s*\(\s*([a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)?)',
+        r'cast\s*\(\s*([a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)?)',
+    ]
+    
+    for pattern in func_patterns:
+        for m in re.finditer(pattern, expr, re.I):
+            col_ref = m.group(1).lower()
+            if '.' in col_ref:
+                parts = col_ref.split('.')
+                cols.append((parts[0], parts[1]))
+            else:
+                cols.append((None, col_ref))
+    
+    return cols
+
+
 def extract_unqualified_cols(expr):
     expr_clean = re.sub(r"'([^']|'')*'", ' ', expr)
     expr_clean = re.sub(r'[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*', ' ', expr_clean, flags=re.I)
@@ -449,6 +499,37 @@ def resolve_expr_sources(expr, table_aliases, subquery_aliases, graph, stats, de
                     graph.edge(node(base_table, col), f"{al}.{col}")
                     stats['alias_src'] += 1
         return out_col, sources
+    
+    # Try to extract columns from Oracle functions
+    func_cols = extract_cols_from_functions(expr_body)
+    if func_cols:
+        sources = set()
+        for al_or_none, col in func_cols:
+            if al_or_none:  # Qualified column like table.column
+                if al_or_none in subquery_aliases:
+                    sources.update(subquery_aliases[al_or_none].get(col, set()))
+                else:
+                    sources.add(f"{al_or_none}.{col}")
+                    if al_or_none in table_aliases:
+                        base_table = table_aliases[al_or_none]
+                        graph.edge(node(base_table, col), f"{al_or_none}.{col}")
+                        stats['alias_src'] += 1
+            else:  # Unqualified column
+                if default_alias:
+                    if default_alias in subquery_aliases:
+                        mapped = subquery_aliases[default_alias].get(col, set())
+                        if mapped:
+                            sources.update(mapped)
+                        else:
+                            sources.add(f"{default_alias}.{col}")
+                    else:
+                        sources.add(f"{default_alias}.{col}")
+                        if default_alias in table_aliases:
+                            base_table = table_aliases[default_alias]
+                            graph.edge(node(base_table, col), f"{default_alias}.{col}")
+                            stats['alias_src'] += 1
+        if sources:
+            return out_col, sources
 
     if default_alias:
         cols = extract_unqualified_cols(expr_body)
@@ -751,6 +832,83 @@ def parse_insert_select_statements(sql, graph, stats, sql_clean=None):
                         stats['join_to_select'] += 1
 
 
+def parse_merge_statements(sql, graph, stats, sql_clean=None):
+    """
+    Parse MERGE statements to capture mappings including JOIN conditions
+    Example: MERGE INTO A USING (SELECT b FROM d JOIN e ON d.f=e.g) src ON (...) 
+             WHEN MATCHED THEN UPDATE SET a = src.b
+    Creates mapping: e.g -> d.f -> d.b -> A.a
+    """
+    if sql_clean is None:
+        sql_clean = strip_comments(sql)
+    
+    # Pattern: MERGE INTO table USING (...) alias ON (...) [WHEN MATCHED THEN UPDATE ...]
+    merge_pattern = re.compile(
+        r'merge\s+into\s+([a-z0-9_".]+)\s+(?:as\s+)?([a-z][a-z0-9_]*)?\s+using\s+',
+        re.I
+    )
+    
+    for m in merge_pattern.finditer(sql_clean):
+        dest_table = norm(m.group(1).split('.')[-1].strip('"'))
+        dest_alias = m.group(2).lower() if m.group(2) else dest_table
+        
+        # Find the USING clause source (could be subquery or table)
+        using_start = m.end()
+        if sql_clean[using_start:using_start+1] == '(':
+            # Subquery in USING clause
+            paren_end = find_matching_paren(sql_clean[using_start:], 0)
+            if paren_end == -1:
+                continue
+            using_sql = sql_clean[using_start+1:using_start+paren_end]
+            
+            # Get alias after the subquery
+            alias_match = re.match(r'\s*([a-z][a-z0-9_]*)', sql_clean[using_start+paren_end+1:], re.I)
+            src_alias = alias_match.group(1).lower() if alias_match else 'src'
+            
+            # Parse the subquery to get mappings
+            select_clause, from_clause = split_select_from(using_sql)
+            if select_clause and from_clause:
+                table_aliases, subquery_aliases, primary_alias = parse_from_clause(from_clause, graph, stats)
+                join_cols_by_alias = parse_join_conditions(
+                    from_clause, table_aliases, subquery_aliases, primary_alias, graph, stats
+                )
+                
+                # Parse SELECT list to get column mappings from subquery
+                exprs = split_paren(select_clause)
+                subquery_cols = {}
+                for expr in exprs:
+                    out_col, sources = resolve_expr_sources(
+                        expr, table_aliases, subquery_aliases, graph, stats, primary_alias
+                    )
+                    if out_col:
+                        subquery_cols[out_col] = sources
+                
+                # Now find WHEN MATCHED THEN UPDATE SET clauses
+                update_pattern = re.compile(
+                    r'when\s+matched\s+then\s+update\s+set\s+(.*?)(?:when|where|;|$)',
+                    re.I | re.S
+                )
+                rest_sql = sql_clean[using_start+paren_end+1:]
+                for upd_match in update_pattern.finditer(rest_sql):
+                    set_clause = upd_match.group(1)
+                    # Parse each assignment in SET clause
+                    for assign in re.finditer(r'([a-z][a-z0-9_]*)\s*=\s*([^,;]+)', set_clause, re.I):
+                        dest_col = norm(assign.group(1))
+                        src_expr = assign.group(2).strip()
+                        
+                        dest_node = node(dest_table, dest_col)
+                        
+                        # Try to match src_alias.column_name
+                        src_match = re.match(rf'{re.escape(src_alias)}\.([a-z][a-z0-9_]*)', src_expr, re.I)
+                        if src_match:
+                            col = src_match.group(1).lower()
+                            # Map from subquery column sources to destination
+                            if col in subquery_cols:
+                                for src in subquery_cols[col]:
+                                    graph.edge(src, dest_node)
+                                    stats['merge_update'] = stats.get('merge_update', 0) + 1
+
+
 def parse_if_assignments(sql_clean, graph, stats):
     if_pattern = re.compile(r'\bif\b[\s\S]*?\bend if\b\s*;', re.I)
     branch_pattern = re.compile(r'\b(if|elsif)\b\s+(.*?)\bthen\b', re.I | re.S)
@@ -806,14 +964,20 @@ def parse_if_assignments(sql_clean, graph, stats):
                     stats['if_assign'] += 1
 
 
-def parse_sql(content, graph, sql_clean=None):
+def parse_sql(content, graph, sql_clean=None, source_file=None):
     stats = defaultdict(int)
+    
+    # Set current file context in graph
+    graph.current_file = source_file
 
     if sql_clean is None:
         sql_clean = strip_comments(content)
 
     # Parse INSERT...SELECT statements (direct table sources)
     parse_insert_select_statements(content, graph, stats, sql_clean)
+
+    # Parse MERGE statements with JOIN conditions
+    parse_merge_statements(content, graph, stats, sql_clean)
 
     # Parse INSERT with nested subqueries (handles mapping 3)
     parse_insert_with_nested_subqueries(content, graph, stats, sql_clean)
@@ -981,8 +1145,9 @@ def process(files_list, queries, max_passes=6):
             sql_clean = strip_comments(content)
         pass_count = max_passes if needs_multi_pass(sql_clean, source_pairs) else 1
         print(f"Processing: {name} (passes: {pass_count})")
+        # Pass file name to parse_sql
         for _ in range(pass_count):
-            stats = parse_sql(content, g, sql_clean)
+            stats = parse_sql(content, g, sql_clean, source_file=name)
             for k, v in stats.items():
                 totals[k] += v
     print(f"\nTotals: {dict(totals)}")
@@ -1043,7 +1208,7 @@ def run_analysis(mappings_path, sql_root, output_path, max_passes=None):
         w = csv.DictWriter(
             f,
             fieldnames=['src_tbl', 'src_col', 'dst_tbl', 'dst_col', 'found',
-                        'longest_path', 'length', 'inter', 'alts']
+                        'longest_path', 'length', 'inter', 'source_files', 'alts']
         )
         w.writeheader()
 
@@ -1072,6 +1237,10 @@ def run_analysis(mappings_path, sql_root, output_path, max_passes=None):
 
             inters = [n for n in longest[1:-1] if '.' not in n or '[' in n] if longest else []
 
+            # Get source files for the path
+            source_files = g.get_source_files_for_path(longest) if longest else set()
+            source_files_str = ','.join(sorted(source_files))
+
             # Only search for alternatives if no direct path found (to save time)
             alts = []
             if not found:
@@ -1088,7 +1257,7 @@ def run_analysis(mappings_path, sql_root, output_path, max_passes=None):
                 'src_tbl': q['source_table'], 'src_col': q['source_field'],
                 'dst_tbl': q['dest_table'], 'dst_col': q['dest_field'],
                 'found': found, 'longest_path': fmt(longest), 'length': len(longest),
-                'inter': ','.join(inters), 'alts': alts_str
+                'inter': ','.join(inters), 'source_files': source_files_str, 'alts': alts_str
             })
 
             if found:
