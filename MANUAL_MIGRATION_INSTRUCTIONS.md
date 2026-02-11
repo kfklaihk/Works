@@ -29,13 +29,14 @@ This guide will help you move the modernization plan documentation from the **Wo
 3. Select **"Extract All..."** (Windows) or **"Extract"** (Mac)
 4. Extract to a convenient location (e.g., `Desktop/modernization-docs`)
 
-**You should now have these 6 files:**
+**You should now have these 7 files:**
 - ✅ README.md
 - ✅ APPLICATION_MODERNIZATION_PLAN.md
 - ✅ TECHNOLOGY_COMPARISON.md
 - ✅ MIGRATION_EXAMPLES.md
 - ✅ QUICKSTART_GUIDE.md
 - ✅ DELIVERABLES_SUMMARY.md
+- ✅ UPDATED_MODERNIZATION_PLAN.md (⭐ New: Supabase + Stock APIs + AI Helper)
 
 ---
 
@@ -113,7 +114,7 @@ TECHNOLOGY_COMPARISON.md
 ### Step 2.5: Add Files to Git
 
 ```bash
-git add README.md APPLICATION_MODERNIZATION_PLAN.md TECHNOLOGY_COMPARISON.md MIGRATION_EXAMPLES.md QUICKSTART_GUIDE.md DELIVERABLES_SUMMARY.md
+git add README.md APPLICATION_MODERNIZATION_PLAN.md TECHNOLOGY_COMPARISON.md MIGRATION_EXAMPLES.md QUICKSTART_GUIDE.md DELIVERABLES_SUMMARY.md UPDATED_MODERNIZATION_PLAN.md
 ```
 
 ### Step 2.6: Check What Will Be Committed
@@ -271,7 +272,7 @@ git checkout -b cursor/application-modernization-plan-2fc2
 
 # Copy files (use file explorer or cp commands)
 
-git add README.md APPLICATION_MODERNIZATION_PLAN.md TECHNOLOGY_COMPARISON.md MIGRATION_EXAMPLES.md QUICKSTART_GUIDE.md DELIVERABLES_SUMMARY.md
+git add README.md APPLICATION_MODERNIZATION_PLAN.md TECHNOLOGY_COMPARISON.md MIGRATION_EXAMPLES.md QUICKSTART_GUIDE.md DELIVERABLES_SUMMARY.md UPDATED_MODERNIZATION_PLAN.md
 git status
 git commit -m "feat: Add comprehensive application modernization plan"
 git push -u origin cursor/application-modernization-plan-2fc2
