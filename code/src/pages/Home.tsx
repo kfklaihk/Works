@@ -1,11 +1,22 @@
-import { Container, Typography, AppBar, Toolbar, Button, Box, Alert } from '@mui/material';
+import { useState } from 'react';
+import { Container, Typography, AppBar, Toolbar, Button, Box, Alert, Tabs, Tab } from '@mui/material';
 import { useAuth } from '../hooks/useAuth';
 import { StockQuote } from '../components/StockQuote';
 import { AIHelper } from '../components/AIHelper';
+import { PortfolioManager } from '../components/PortfolioManager';
+import { TradingInterface } from '../components/TradingInterface';
+import { TransactionHistory } from '../components/TransactionHistory';
 import { LogOut } from 'lucide-react';
 
 export function Home() {
   const { user, signOut } = useAuth();
+  const [activeTab, setActiveTab] = useState(0);
+  const [refreshKey, setRefreshKey] = useState(0);
+
+  const handleTradeComplete = () => {
+    // Refresh portfolio data when trade is completed
+    setRefreshKey((prev) => prev + 1);
+  };
 
   return (
     <>
@@ -31,97 +42,76 @@ export function Home() {
       </AppBar>
 
       {/* Main Content */}
-      <Container maxWidth="lg" sx={{ mt: 4, mb: 4 }}>
+      <Container maxWidth="xl" sx={{ mt: 4, mb: 4 }}>
         {/* Welcome Section */}
         <Box sx={{ mb: 4 }}>
           <Typography variant="h4" gutterBottom fontWeight="bold">
             Welcome back! 👋
           </Typography>
           <Typography variant="body1" color="text.secondary">
-            Track and manage your stock portfolio across Hong Kong, China, and US markets.
+            Manage your stock portfolio, execute trades, and track performance across HK, CN, and US markets.
           </Typography>
         </Box>
 
-        {/* Info Alert */}
-        <Alert severity="info" sx={{ mb: 3 }}>
-          <Typography variant="body2">
-            <strong>End-of-Day (EOD) Data:</strong> Stock prices shown are from the previous trading day's close.
-            Data is sourced from Marketstack API and updated daily.
-          </Typography>
-        </Alert>
-
-        {/* Stock Quote Section */}
-        <StockQuote />
-
-        {/* Features Preview */}
-        <Box sx={{ mt: 4, p: 3, bgcolor: 'grey.50', borderRadius: 2 }}>
-          <Typography variant="h6" gutterBottom fontWeight="bold">
-            ✨ Available Features
-          </Typography>
-          <Box component="ul" sx={{ pl: 2 }}>
-            <Typography component="li" variant="body2" sx={{ mb: 1 }}>
-              📈 <strong>Real-time Stock Quotes:</strong> Get end-of-day prices for HK, CN, and US stocks
-            </Typography>
-            <Typography component="li" variant="body2" sx={{ mb: 1 }}>
-              🤖 <strong>AI Stock Assistant:</strong> Click the chat icon to ask questions about stocks and investing
-            </Typography>
-            <Typography component="li" variant="body2" sx={{ mb: 1 }}>
-              🔒 <strong>Secure Authentication:</strong> Your data is protected with Supabase authentication
-            </Typography>
-            <Typography component="li" variant="body2" sx={{ mb: 1 }}>
-              💾 <strong>Data Caching:</strong> Efficient caching reduces API calls and improves performance
-            </Typography>
-          </Box>
+        {/* Tabs Navigation */}
+        <Box sx={{ borderBottom: 1, borderColor: 'divider', mb: 3 }}>
+          <Tabs value={activeTab} onChange={(_, newValue) => setActiveTab(newValue)}>
+            <Tab label="Portfolio Overview" />
+            <Tab label="Trading" />
+            <Tab label="Transaction History" />
+            <Tab label="Stock Quotes" />
+          </Tabs>
         </Box>
 
-        {/* How to Use */}
-        <Box sx={{ mt: 3, p: 3, bgcolor: 'primary.50', borderRadius: 2, border: 1, borderColor: 'primary.200' }}>
-          <Typography variant="h6" gutterBottom fontWeight="bold" color="primary.main">
-            🚀 How to Use
-          </Typography>
-          <Box component="ol" sx={{ pl: 2 }}>
-            <Typography component="li" variant="body2" sx={{ mb: 1 }}>
-              Enter a stock symbol (e.g., <code>0005</code> for HSBC, <code>AAPL</code> for Apple)
-            </Typography>
-            <Typography component="li" variant="body2" sx={{ mb: 1 }}>
-              Select the market (Hong Kong, China, or US)
-            </Typography>
-            <Typography component="li" variant="body2" sx={{ mb: 1 }}>
-              Click "Get Quote" to fetch the latest end-of-day data
-            </Typography>
-            <Typography component="li" variant="body2" sx={{ mb: 1 }}>
-              Click the floating chat icon (bottom right) to ask the AI assistant questions
-            </Typography>
+        {/* Tab Content */}
+        {activeTab === 0 && (
+          <Box key={refreshKey}>
+            <Alert severity="info" sx={{ mb: 3 }}>
+              <Typography variant="body2">
+                <strong>Portfolio Management:</strong> View your holdings, track performance, and manage multiple portfolios.
+                Prices are updated from EOD (End of Day) data.
+              </Typography>
+            </Alert>
+            <PortfolioManager />
           </Box>
-        </Box>
+        )}
 
-        {/* Market Info */}
-        <Box sx={{ mt: 3, display: 'flex', gap: 2, flexWrap: 'wrap' }}>
-          <Box sx={{ flex: 1, minWidth: 250, p: 2, bgcolor: 'error.50', borderRadius: 1 }}>
-            <Typography variant="subtitle2" fontWeight="bold" color="error.main">
-              🇭🇰 Hong Kong Market
-            </Typography>
-            <Typography variant="caption" display="block" sx={{ mt: 1 }}>
-              Use 4-digit codes (e.g., 0005, 0700, 0941)
-            </Typography>
+        {activeTab === 1 && (
+          <Box>
+            <Alert severity="warning" sx={{ mb: 3 }}>
+              <Typography variant="body2">
+                <strong>Trading Interface:</strong> Buy and sell stocks across multiple markets.
+                Transactions update your portfolio holdings in real-time.
+              </Typography>
+            </Alert>
+            <TradingInterface onTradeComplete={handleTradeComplete} />
           </Box>
-          <Box sx={{ flex: 1, minWidth: 250, p: 2, bgcolor: 'warning.50', borderRadius: 1 }}>
-            <Typography variant="subtitle2" fontWeight="bold" color="warning.main">
-              🇨🇳 China Market
-            </Typography>
-            <Typography variant="caption" display="block" sx={{ mt: 1 }}>
-              Use 6-digit codes (e.g., 600000, 601398)
-            </Typography>
+        )}
+
+        {activeTab === 2 && (
+          <Box>
+            <Alert severity="info" sx={{ mb: 3 }}>
+              <Typography variant="body2">
+                <strong>Transaction History:</strong> View all your past trades with detailed information.
+                Filter by portfolio or date to analyze your trading activity.
+              </Typography>
+            </Alert>
+            <TransactionHistory />
           </Box>
-          <Box sx={{ flex: 1, minWidth: 250, p: 2, bgcolor: 'success.50', borderRadius: 1 }}>
-            <Typography variant="subtitle2" fontWeight="bold" color="success.main">
-              🇺🇸 US Market
-            </Typography>
-            <Typography variant="caption" display="block" sx={{ mt: 1 }}>
-              Use ticker symbols (e.g., AAPL, MSFT, GOOGL)
-            </Typography>
+        )}
+
+        {activeTab === 3 && (
+          <Box>
+            <Alert severity="info" sx={{ mb: 3 }}>
+              <Typography variant="body2">
+                <strong>End-of-Day (EOD) Data:</strong> Stock prices shown are from the previous trading day's close.
+                Data is sourced from Marketstack API and updated daily.
+              </Typography>
+            </Alert>
+            <StockQuote />
           </Box>
-        </Box>
+        )}
+
       </Container>
 
       {/* AI Helper Chatbot */}
