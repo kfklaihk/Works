@@ -168,14 +168,27 @@ The built files will be in the `dist/` folder.
 
 ## 🚀 Deployment
 
-### Deploy to Vercel
+### Quick Deploy to Vercel (Recommended)
+
+```bash
+# Run the automated deployment script
+./deploy-to-vercel.sh
+```
+
+**Or manually:**
 
 ```bash
 npm install -g vercel
-vercel
+vercel login
+vercel --prod
 ```
 
-Add environment variables in Vercel dashboard.
+**After deployment:**
+1. Add environment variables in Vercel dashboard
+2. Redeploy
+3. Update Supabase redirect URLs
+
+**See complete guide:** `../VERCEL_DEPLOYMENT_GUIDE.md`
 
 ### Deploy to Netlify
 
