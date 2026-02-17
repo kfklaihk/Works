@@ -1,29 +1,21 @@
 # Works
-Programs developed and used in real projects
+Tools developed and used in work
 
-## Cloud Function (Gen2) deployment
+## Generate template sql to hash particular PII fields of specific tables with specific treatment method which are defined in a tabular config csv file
+Generate_Script_From_Config.ipynb
 
-If you deploy the `sql_mapping_runner` with a Cloud Storage trigger, the event
-type does not expose an `object` attribute. To filter by object name, use the
-`subject` attribute (which is `objects/<objectName>` for GCS events) with the
-path-pattern filter.
+## Parse the sql mapping paths from zip of directories of oracle sql files and verify against mappings.json
+### Standalone version
+parse_mappings_desktop_standalone.py
 
-Example:
+### Colab version
+parse_mappings_colab_10.py
 
-gcloud functions deploy sql_mapping_runner \
-  --gen2 \
-  --runtime=python311 \
-  --region=us-central1 \
-  --source=. \
-  --entry-point=gcs_mapping_handler \
-  --trigger-event-filters="type=google.cloud.storage.object.v1.finalized" \
-  --trigger-event-filters="bucket=kevinlaiproject" \
-  --trigger-event-filters-path-pattern="subject=objects/inputs/*.zip" \
-  --max-instances=1 \
-  --timeout=540 \
-  --memory=2Gi \
-  --cpu=1 \
-  --set-env-vars="MAPPINGS_BLOB=inputs/mappings_all.json,OUTPUT_PREFIX=outputs,MAX_PASSES=6"
+### Google Cloud Function version
+cloud_function_deploy.md
+deploy.sh
+main.py
+parse_mappings_colab_10.py
+requirements.txt
 
-If you want to trigger on all objects in the bucket, drop the
-`--trigger-event-filters-path-pattern` flag entirely.
+
